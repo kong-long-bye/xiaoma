@@ -1,125 +1,345 @@
+from __future__ import annotations
+
+"""模型预测入口。
+
+该文件只负责加载训练产物并生成坐标预测，不重新训练模型。
+默认可以使用当前 Git 分支下最新一次训练结果。
+"""
+
 import argparse
-import json
+from dataclasses import fields
 from pathlib import Path
 
 import joblib
 import numpy as np
 import pandas as pd
 import torch
+from torch.utils.data import DataLoader, TensorDataset
 
-from config import DEVICE, LOG_DIR, MODEL_DIR, TEST_CSV
-from model import CoordinateMLP, TransformerAutoencoder
-from utils import (
-    calculate_metrics,
-    download_dataset,
-    encode_features,
-    load_preprocessors,
-    transform_dataframe,
+from src.config import ModelConfig, PROJECT_ROOT
+from src.model import WiFiTransformerAutoencoder
+from src.utils import (
+    create_run_paths,
+    get_git_branch,
+    latest_run_dir,
+    select_device,
+    set_seed,
+    setup_logging,
 )
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="使用已训练模型预测 validationData")
-    parser.add_argument("--input-csv", type=Path, default=TEST_CSV)
-    parser.add_argument(
-        "--output-csv",
-        type=Path,
-        default=LOG_DIR / "predictions.csv",
+def _load_checkpoint(
+    path: Path,
+    device: torch.device,
+) -> dict[str, object]:
+    """兼容不同 PyTorch 版本加载 transformer.pt。"""
+
+    try:
+        return torch.load(
+            path,
+            map_location=device,
+            weights_only=False,
+        )
+    except TypeError:
+        # 较旧版本的 PyTorch 没有 weights_only 参数。
+        return torch.load(
+            path,
+            map_location=device,
+        )
+
+
+def resolve_model_dir(
+    model_dir: str,
+    model_root: Path,
+    branch: str | None,
+) -> Path:
+    """解析用户指定的模型目录。
+
+    model_dir 不是 latest:
+        直接使用明确指定的目录。
+
+    model_dir 是 latest:
+        优先寻找当前分支的最新模型；
+        如果当前分支没有模型，再寻找整个 model 目录中的最新模型。
+    """
+
+    if model_dir != "latest":
+        resolved = Path(model_dir).expanduser().resolve()
+
+        if not resolved.exists():
+            raise FileNotFoundError(resolved)
+
+        return resolved
+
+    branch_name = branch or get_git_branch(PROJECT_ROOT)
+
+    try:
+        return latest_run_dir(
+            model_root,
+            branch_name,
+        )
+    except FileNotFoundError:
+        # 非 Git 环境或切换分支后，允许回退到全局最新模型。
+        candidates = sorted(
+            path
+            for path in model_root.glob("*/*")
+            if (
+                path.is_dir()
+                and path.parent.name != "log"
+            )
+        )
+
+        if not candidates:
+            raise
+
+        return candidates[-1]
+
+
+@torch.inference_mode()
+def extract_latent(
+    model: WiFiTransformerAutoencoder,
+    features: np.ndarray,
+    device: torch.device,
+    batch_size: int,
+) -> np.ndarray:
+    """分批提取预测数据的 Transformer latent 特征。"""
+
+    loader = DataLoader(
+        TensorDataset(torch.from_numpy(features)),
+        batch_size=batch_size,
+        shuffle=False,
     )
+
+    chunks: list[np.ndarray] = []
+    model.eval()
+
+    for (batch,) in loader:
+        latent = model.encode(batch.to(device))
+        chunks.append(latent.cpu().numpy())
+
+    return np.concatenate(
+        chunks,
+        axis=0,
+    ).astype(np.float32)
+
+
+def predict(
+    input_csv: Path,
+    model_dir: Path,
+    output_csv: Path,
+    device_name: str,
+    batch_size: int,
+    log_file: Path,
+) -> Path:
+    """加载模型并对输入 CSV 执行预测。"""
+
+    logger = setup_logging(log_file)
+
+    # 预测阶段同样设置线程数，避免部分 CPU 环境线程调度过慢。
+    set_seed(0)
+    device = select_device(device_name)
+
+    logger.info("Loading model from %s", model_dir)
+
+    # 加载 sklearn 预处理器、特征列表和 SVR。
+    pipeline = joblib.load(
+        model_dir / "pipeline.joblib"
+    )
+
+    # 加载 Transformer 结构配置和权重。
+    checkpoint = _load_checkpoint(
+        model_dir / str(pipeline["transformer_file"]),
+        device,
+    )
+
+    # 只读取当前 ModelConfig 中仍然存在的字段，
+    # 使旧模型在增加非必要配置项后仍有机会被加载。
+    valid_names = {
+        item.name for item in fields(ModelConfig)
+    }
+
+    model_config = ModelConfig(
+        **{
+            key: value
+            for key, value
+            in checkpoint["model_config"].items()
+            if key in valid_names
+        }
+    )
+
+    model = WiFiTransformerAutoencoder(
+        input_dim=int(checkpoint["input_dim"]),
+        config=model_config,
+    ).to(device)
+
+    model.load_state_dict(checkpoint["state_dict"])
+
+    frame = pd.read_csv(input_csv)
+    feature_names = list(pipeline["feature_names"])
+
+    # 预测数据必须至少包含训练时保留下来的全部 WAP 特征。
+    missing_columns = [
+        column
+        for column in feature_names
+        if column not in frame.columns
+    ]
+
+    if missing_columns:
+        raise KeyError(
+            f"Input CSV is missing "
+            f"{len(missing_columns)} required WAP columns."
+        )
+
+    # 预测阶段必须使用与训练阶段完全相同的缺失值规则和 scaler。
+    features = (
+        frame[feature_names]
+        .replace(
+            pipeline["raw_missing_value"],
+            pipeline["filled_missing_value"],
+        )
+        .fillna(
+            pipeline["filled_missing_value"]
+        )
+    )
+
+    scaled = pipeline["feature_scaler"].transform(
+        features.to_numpy()
+    ).astype(np.float32)
+
+    latent = extract_latent(
+        model,
+        scaled,
+        device,
+        batch_size,
+    )
+
+    prediction = pipeline["regressor"].predict(latent)
+
+    # 在原始 CSV 后追加预测坐标，方便继续分析其他字段。
+    output = frame.copy()
+    output["PRED_LONGITUDE"] = prediction[:, 0]
+    output["PRED_LATITUDE"] = prediction[:, 1]
+
+    # 输入数据包含真实坐标时，额外计算每条记录的二维距离误差。
+    if {"LONGITUDE", "LATITUDE"}.issubset(
+        output.columns
+    ):
+        truth = output[
+            ["LONGITUDE", "LATITUDE"]
+        ].to_numpy()
+
+        output["ERROR_DISTANCE"] = np.linalg.norm(
+            truth - prediction,
+            axis=1,
+        )
+
+    output_csv.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    output.to_csv(
+        output_csv,
+        index=False,
+        encoding="utf-8",
+    )
+
+    logger.info(
+        "Saved %d predictions to %s",
+        len(output),
+        output_csv,
+    )
+
+    return output_csv
+
+
+def parse_args() -> argparse.Namespace:
+    """定义预测命令行参数。"""
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Predict coordinates with a trained "
+            "Transformer + SVR model."
+        )
+    )
+
+    parser.add_argument(
+        "--input",
+        type=Path,
+        required=True,
+    )
+    parser.add_argument(
+        "--model-dir",
+        type=str,
+        default="latest",
+    )
+    parser.add_argument(
+        "--model-root",
+        type=Path,
+        default=PROJECT_ROOT / "model",
+    )
+    parser.add_argument(
+        "--branch",
+        type=str,
+        default=None,
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=512,
+    )
+
     return parser.parse_args()
 
 
 def main() -> None:
+    """预测命令行主函数。"""
+
     args = parse_args()
-    if args.input_csv == TEST_CSV and not TEST_CSV.exists():
-        download_dataset()
 
-    with (MODEL_DIR / "run_config.json").open("r", encoding="utf-8") as file:
-        run_config = json.load(file)
+    model_dir = resolve_model_dir(
+        args.model_dir,
+        args.model_root,
+        args.branch,
+    )
 
-    data = pd.read_csv(args.input_csv)
-    building_id = run_config["building_id"]
+    # 预测只创建日志目录，不创建新的空模型目录。
+    log_paths = create_run_paths(
+        model_root=args.model_root,
+        project_root=PROJECT_ROOT,
+        branch=args.branch,
+        log_suffix="predict",
+        create_artifact_dir=False,
+    )
 
-    # 模型若只在 Building 0 上训练，预测时也只能评估 validationData 中的 Building 0。
-    if building_id is not None:
-        if "BUILDINGID" not in data.columns:
-            raise ValueError(
-                "当前模型是单建筑模型，但输入 CSV 缺少 BUILDINGID，无法安全过滤。"
-            )
-        before_count = len(data)
-        data = data[data["BUILDINGID"] == building_id].reset_index(drop=True)
-        print(
-            f"按训练配置过滤 BuildingID={building_id}："
-            f"{before_count} 条 -> {len(data)} 条"
+    output = args.output or (
+        model_dir
+        / (
+            f"predictions_{args.input.stem}_"
+            f"{log_paths.timestamp}.csv"
         )
-
-    if data.empty:
-        raise ValueError("输入数据在 BuildingID 过滤后为空")
-
-    feature_scaler, target_scaler = load_preprocessors(
-        MODEL_DIR / "preprocessors.joblib"
-    )
-    x_data, y_scaled = transform_dataframe(
-        data,
-        feature_scaler,
-        target_scaler,
     )
 
-    device = torch.device(DEVICE)
-    checkpoint = torch.load(
-        MODEL_DIR / "transformer_autoencoder.pt",
-        map_location=device,
-        weights_only=False,
-    )
-    autoencoder = TransformerAutoencoder(**checkpoint["model_params"]).to(device)
-    autoencoder.load_state_dict(checkpoint["state_dict"])
-
-    batch_size = run_config["training_config"]["batch_size"]
-    features = encode_features(autoencoder, x_data, device, batch_size)
-
-    if run_config["regressor"] == "svr":
-        regressor = joblib.load(MODEL_DIR / "svr_regressor.joblib")
-        pred_scaled = regressor.predict(features)
-    else:
-        training_config = run_config["training_config"]
-        regressor = CoordinateMLP(
-            checkpoint["model_params"]["d_model"],
-            training_config["mlp_hidden_dim"],
-        ).to(device)
-        regressor.load_state_dict(
-            torch.load(
-                MODEL_DIR / "mlp_regressor.pt",
-                map_location=device,
-                weights_only=True,
-            )
-        )
-        regressor.eval()
-        with torch.no_grad():
-            pred_scaled = regressor(
-                torch.from_numpy(features).to(device)
-            ).cpu().numpy()
-
-    predictions = target_scaler.inverse_transform(pred_scaled)
-    output = pd.DataFrame(
-        {
-            "PRED_LONGITUDE": predictions[:, 0],
-            "PRED_LATITUDE": predictions[:, 1],
-        }
+    result = predict(
+        input_csv=args.input,
+        model_dir=model_dir,
+        output_csv=output,
+        device_name=args.device,
+        batch_size=args.batch_size,
+        log_file=log_paths.log_file,
     )
 
-    if y_scaled is not None:
-        y_true = target_scaler.inverse_transform(y_scaled)
-        output["TRUE_LONGITUDE"] = y_true[:, 0]
-        output["TRUE_LATITUDE"] = y_true[:, 1]
-        output["POSITION_ERROR_M"] = np.linalg.norm(
-            predictions - y_true,
-            axis=1,
-        )
-        print("预测指标：", calculate_metrics(y_true, predictions))
-
-    args.output_csv.parent.mkdir(parents=True, exist_ok=True)
-    output.to_csv(args.output_csv, index=False)
-    print(f"预测结果已保存到：{args.output_csv}")
+    print(f"Prediction file: {result}")
 
 
 if __name__ == "__main__":

@@ -1,235 +1,244 @@
+from __future__ import annotations
+
+"""项目公共工具函数。
+
+这里集中处理随机种子、日志、Git 分支名称、运行目录和评估指标。
+训练和预测入口只负责业务流程，不再重复这些基础代码。
+"""
+
 import json
 import logging
+import os
 import random
-import shutil
-import urllib.request
-import zipfile
+import re
+import subprocess
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+from typing import Any
 
-import joblib
 import numpy as np
-import pandas as pd
 import torch
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import MinMaxScaler, StandardScaler
-from torch.utils.data import DataLoader, TensorDataset
-
-from config import (
-    DATASET_URL,
-    DATA_DIR,
-    LOG_DIR,
-    MODEL_DIR,
-    SEED,
-    TARGET_COLUMNS,
-    TEST_CSV,
-    TRAIN_CSV,
-    WAP_DIM,
-)
 
 
-def ensure_directories() -> None:
-    """创建项目要求的目录。"""
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOGGER_NAME = "xiaoma"
 
 
-def download_dataset() -> None:
-    """缺少数据时，从 UCI 官方地址下载并提取数据。"""
-    ensure_directories()
-    if TRAIN_CSV.exists() and TEST_CSV.exists():
-        return
+@dataclass(frozen=True)
+class RunPaths:
+    """一次训练或预测任务对应的路径信息。"""
 
-    zip_path = DATA_DIR / "ujiindoorloc.zip"
-    extract_dir = DATA_DIR / "_extract"
-    print("未检测到 UJIIndoorLoc 数据，正在从 UCI 下载……")
+    branch: str
+    timestamp: str
+    artifact_dir: Path
+    log_file: Path
+
+
+def safe_name(value: str) -> str:
+    """将分支名或后缀转换成适合文件夹和文件名的安全字符串。"""
+
+    cleaned = re.sub(r"[^0-9A-Za-z._-]+", "-", value.strip())
+    return cleaned.strip("-._") or "unknown"
+
+
+def get_git_branch(project_root: Path) -> str:
+    """获取当前 Git 分支名。
+
+    获取顺序:
+    1. CI 环境变量 GIT_BRANCH / BRANCH_NAME；
+    2. git branch --show-current；
+    3. 无 Git 环境时返回 no-git。
+    """
+
+    env_branch = os.environ.get("GIT_BRANCH") or os.environ.get("BRANCH_NAME")
+    if env_branch:
+        return safe_name(env_branch.removeprefix("origin/"))
+
     try:
-        urllib.request.urlretrieve(DATASET_URL, zip_path)
-        with zipfile.ZipFile(zip_path, "r") as archive:
-            archive.extractall(extract_dir)
-
-        train_source = next(extract_dir.rglob("trainingData.csv"))
-        test_source = next(extract_dir.rglob("validationData.csv"))
-        shutil.copy2(train_source, TRAIN_CSV)
-        shutil.copy2(test_source, TEST_CSV)
-    except Exception as exc:
-        raise RuntimeError(
-            "数据自动下载失败。请手动将 trainingData.csv 和 validationData.csv 放入 data 目录。"
-        ) from exc
-    finally:
-        if zip_path.exists():
-            zip_path.unlink()
-        if extract_dir.exists():
-            shutil.rmtree(extract_dir)
+        result = subprocess.run(
+            ["git", "-C", str(project_root), "branch", "--show-current"],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        return safe_name(result.stdout.strip() or "detached")
+    except (OSError, subprocess.SubprocessError):
+        return "no-git"
 
 
-def set_seed(seed: int = SEED) -> None:
-    """固定随机种子。"""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.set_num_threads(min(4, max(1, torch.get_num_threads())))
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+def now_timestamp() -> str:
+    """返回用于目录和日志文件名的本地时间字符串。"""
+
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
-def build_logger(log_path: Path) -> logging.Logger:
-    """同时输出到终端和日志文件。"""
-    logger = logging.getLogger("uji_transformer")
+def create_run_paths(
+    model_root: Path,
+    project_root: Path,
+    branch: str | None = None,
+    log_suffix: str | None = None,
+    create_artifact_dir: bool = True,
+) -> RunPaths:
+    """为一次任务创建模型目录和 UTF-8 日志路径。
+
+    训练产物:
+        model/<branch>/<timestamp>/
+
+    日志:
+        model/log/<branch>/<timestamp>_<branch>.log
+    """
+
+    branch_name = safe_name(branch) if branch else get_git_branch(project_root)
+    timestamp = now_timestamp()
+
+    artifact_dir = model_root / branch_name / timestamp
+    log_dir = model_root / "log" / branch_name
+
+    # 预测任务通常只需要日志，不需要创建一个空的模型产物目录。
+    if create_artifact_dir:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    suffix = f"_{safe_name(log_suffix)}" if log_suffix else ""
+    log_file = log_dir / f"{timestamp}_{branch_name}{suffix}.log"
+
+    return RunPaths(
+        branch=branch_name,
+        timestamp=timestamp,
+        artifact_dir=artifact_dir,
+        log_file=log_file,
+    )
+
+
+def setup_logging(log_file: Path) -> logging.Logger:
+    """创建同时输出到终端和 UTF-8 文件的 logger。"""
+
+    logger = logging.getLogger(LOGGER_NAME)
     logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    # 避免在同一个 Python 进程中重复调用时叠加 handler。
     logger.handlers.clear()
 
-    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
     stream_handler = logging.StreamHandler()
     stream_handler.setFormatter(formatter)
-    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+
+    # 显式指定 encoding="utf-8"，避免 Windows 默认编码造成中文乱码。
+    file_handler = logging.FileHandler(
+        log_file,
+        mode="a",
+        encoding="utf-8",
+    )
     file_handler.setFormatter(formatter)
+
     logger.addHandler(stream_handler)
     logger.addHandler(file_handler)
     return logger
 
 
-def get_wap_columns() -> list[str]:
-    """返回 WAP001 到 WAP520。"""
-    return [f"WAP{i:03d}" for i in range(1, WAP_DIM + 1)]
+def set_seed(seed: int) -> None:
+    """设置随机种子，并限制默认 CPU 线程数量。
+
+    某些机器会给 PyTorch 分配很多 CPU 线程。
+    对本项目这种中小型 Transformer，线程过多反而可能更慢。
+    可通过环境变量 XIAOMA_TORCH_THREADS 手动覆盖。
+    """
+
+    thread_count = max(
+        1,
+        int(os.environ.get("XIAOMA_TORCH_THREADS", "1")),
+    )
+    torch.set_num_threads(thread_count)
+
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        # PyTorch 只允许在并行任务开始前设置 inter-op 线程。
+        pass
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
-def load_data(
-    building_id: int | None = None,
-    smoke_test: bool = False,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """读取官方训练集和 validationData，并按 BuildingID 同步过滤。"""
-    download_dataset()
-    train_df = pd.read_csv(TRAIN_CSV)
-    test_df = pd.read_csv(TEST_CSV)
+def select_device(requested: str) -> torch.device:
+    """根据命令行参数选择 CPU 或 CUDA 设备。"""
 
-    if building_id is not None:
-        train_df = train_df[train_df["BUILDINGID"] == building_id]
-        test_df = test_df[test_df["BUILDINGID"] == building_id]
+    requested = requested.lower()
 
-    if train_df.empty or test_df.empty:
-        raise ValueError("指定 BuildingID 后没有可用数据")
+    if requested == "auto":
+        return torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
 
-    if smoke_test:
-        train_count = min(8, len(train_df))
-        test_count = min(4, len(test_df))
-        train_df = train_df.sample(train_count, random_state=SEED)
-        test_df = test_df.sample(test_count, random_state=SEED)
+    if requested.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA was requested, but no CUDA device is available."
+        )
 
-    return train_df.reset_index(drop=True), test_df.reset_index(drop=True)
+    return torch.device(requested)
 
 
-def _prepare_rssi(df: pd.DataFrame) -> np.ndarray:
-    """将未检测到信号的 100 替换为 -105 dB。"""
-    wap_columns = get_wap_columns()
-    missing_columns = [column for column in wap_columns if column not in df.columns]
-    if missing_columns:
-        raise ValueError(f"数据缺少 WAP 列：{missing_columns[:3]}")
+def save_json(payload: dict[str, Any], path: Path) -> None:
+    """以 UTF-8、保留中文的方式写入 JSON。"""
 
-    values = df[wap_columns].replace(100, -105).to_numpy(dtype=np.float32)
-    if not np.isfinite(values).all():
-        raise ValueError("RSSI 数据包含 NaN 或无穷值")
-    return values
-
-
-def fit_preprocessors(
-    train_df: pd.DataFrame,
-) -> tuple[np.ndarray, np.ndarray, MinMaxScaler, StandardScaler]:
-    """缩放器只在训练集上拟合，避免验证集信息泄漏。"""
-    feature_scaler = MinMaxScaler(feature_range=(0, 1))
-    target_scaler = StandardScaler()
-
-    x_train = feature_scaler.fit_transform(_prepare_rssi(train_df)).astype(np.float32)
-    y_train = target_scaler.fit_transform(
-        train_df[TARGET_COLUMNS].to_numpy(dtype=np.float32)
-    ).astype(np.float32)
-    return x_train, y_train, feature_scaler, target_scaler
-
-
-def transform_dataframe(
-    df: pd.DataFrame,
-    feature_scaler: MinMaxScaler,
-    target_scaler: StandardScaler | None = None,
-) -> tuple[np.ndarray, np.ndarray | None]:
-    """用训练集缩放器转换验证数据或待预测数据。"""
-    x_data = feature_scaler.transform(_prepare_rssi(df)).astype(np.float32)
-    y_data = None
-    if target_scaler is not None and all(column in df.columns for column in TARGET_COLUMNS):
-        y_data = target_scaler.transform(
-            df[TARGET_COLUMNS].to_numpy(dtype=np.float32)
-        ).astype(np.float32)
-    return x_data, y_data
-
-
-def save_preprocessors(
-    feature_scaler: MinMaxScaler,
-    target_scaler: StandardScaler,
-    path: Path,
-) -> None:
-    joblib.dump(
-        {"feature_scaler": feature_scaler, "target_scaler": target_scaler},
-        path,
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        ),
+        encoding="utf-8",
     )
 
 
-def load_preprocessors(path: Path) -> tuple[MinMaxScaler, StandardScaler]:
-    preprocessors = joblib.load(path)
-    return preprocessors["feature_scaler"], preprocessors["target_scaler"]
+def latest_run_dir(model_root: Path, branch: str) -> Path:
+    """返回指定分支下按时间排序的最新模型目录。"""
 
-
-def make_autoencoder_loaders(
-    x_data: np.ndarray,
-    batch_size: int,
-) -> tuple[DataLoader, DataLoader]:
-    """从 trainingData 内部划分自编码器训练集和早停验证集。"""
-    val_ratio = 0.2 if len(x_data) < 200 else 0.1
-    x_train, x_val = train_test_split(
-        x_data,
-        test_size=val_ratio,
-        random_state=SEED,
+    branch_root = model_root / safe_name(branch)
+    candidates = sorted(
+        (path for path in branch_root.glob("*") if path.is_dir()),
+        key=lambda path: path.name,
     )
-    train_dataset = TensorDataset(torch.from_numpy(x_train))
-    val_dataset = TensorDataset(torch.from_numpy(x_val))
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    return train_loader, val_loader
+
+    if not candidates:
+        raise FileNotFoundError(
+            f"No trained model was found under {branch_root}."
+        )
+
+    return candidates[-1]
 
 
-def encode_features(
-    model: torch.nn.Module,
-    x_data: np.ndarray,
-    device: torch.device,
-    batch_size: int,
-) -> np.ndarray:
-    """批量提取 CLS 编码特征。"""
-    loader = DataLoader(
-        TensorDataset(torch.from_numpy(x_data)),
-        batch_size=batch_size,
-        shuffle=False,
-    )
-    encoded_batches: list[np.ndarray] = []
-    model.eval()
-    with torch.no_grad():
-        for (batch_x,) in loader:
-            encoded = model.encode(batch_x.to(device))
-            encoded_batches.append(encoded.cpu().numpy())
-    return np.concatenate(encoded_batches, axis=0)
+def distance_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+) -> dict[str, float]:
+    """计算室内定位常用的二维欧氏距离误差。"""
 
+    distances = np.linalg.norm(y_true - y_pred, axis=1)
+    errors = y_true - y_pred
 
-def calculate_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
-    """UJIIndoorLoc 坐标本身采用米制平面坐标，可直接计算欧氏距离。"""
-    distances = np.linalg.norm(y_pred - y_true, axis=1)
     return {
-        "rmse": float(np.sqrt(mean_squared_error(y_true, y_pred))),
-        "mae": float(mean_absolute_error(y_true, y_pred)),
-        "r2": float(r2_score(y_true, y_pred)),
-        "mean_position_error_m": float(np.mean(distances)),
-        "median_position_error_m": float(np.median(distances)),
-        "std_position_error_m": float(np.std(distances)),
+        "distance_mean": float(np.mean(distances)),
+        "distance_median": float(np.median(distances)),
+        "distance_p90": float(np.percentile(distances, 90)),
+        "distance_max": float(np.max(distances)),
+        "longitude_rmse": float(
+            np.sqrt(np.mean(errors[:, 0] ** 2))
+        ),
+        "latitude_rmse": float(
+            np.sqrt(np.mean(errors[:, 1] ** 2))
+        ),
     }
-
-
-def save_json(data: dict, path: Path) -> None:
-    with path.open("w", encoding="utf-8") as file:
-        json.dump(data, file, ensure_ascii=False, indent=2)

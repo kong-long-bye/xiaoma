@@ -1,95 +1,263 @@
+
+from __future__ import annotations
+
+"""模型定义。
+
+模型同时支持两种 token 化方式：
+
+1. wap 模式：
+   每一个 WAP 特征作为一个独立 token。
+
+2. patch 模式：
+   每 patch_size 个连续 WAP 特征组成一个 token。
+
+两种模式最终都会经过 TransformerEncoder 提取 latent 特征，
+再由解码器重建原始 WAP 输入。
+"""
+
+import math
+from dataclasses import asdict
+
 import torch
+import torch.nn.functional as F
 from torch import nn
 
+from src.config import ModelConfig
 
-class TransformerAutoencoder(nn.Module):
-    """使用 CLS token 汇聚 520 个 WAP 的 Transformer 自编码器。"""
+
+class WiFiTransformerAutoencoder(nn.Module):
+    """同时支持 WAP token 和 Patch token 的 Transformer 自编码器。
+
+    输入:
+        shape = (batch_size, WAP特征数量)
+
+    输出:
+        forward() 返回重建后的 WAP 特征；
+        encode() 返回给 SVR 使用的 latent 特征；
+        decode() 根据 latent 特征重建原始输入。
+
+    token_mode="wap":
+        每一个 WAP 数值作为一个独立 token。
+
+    token_mode="patch":
+        每 patch_size 个连续 WAP 数值组成一个 token。
+    """
 
     def __init__(
         self,
-        input_dim: int = 520,
-        d_model: int = 128,
-        nhead: int = 16,
-        num_layers: int = 15,
-        dim_feedforward: int = 512,
-        dropout: float = 0.0446,
+        input_dim: int,
+        config: ModelConfig,
     ) -> None:
         super().__init__()
-        if d_model % nhead != 0:
-            raise ValueError("d_model 必须能够被 nhead 整除")
 
-        self.input_dim = input_dim
-        self.d_model = d_model
+        # 提前检查配置，避免训练时出现难以定位的形状错误。
+        if input_dim <= 0:
+            raise ValueError("input_dim must be positive.")
 
-        # 每个 RSSI 标量映射到 d_model 维。
-        self.input_projection = nn.Linear(1, d_model)
+        if config.d_model % config.nhead != 0:
+            raise ValueError(
+                "d_model must be divisible by nhead."
+            )
 
-        # WAP 编号必须被保留，否则模型无法区分不同接入点。
-        self.ap_embedding = nn.Parameter(torch.zeros(1, input_dim, d_model))
+        if config.token_mode not in {"wap", "patch"}:
+            raise ValueError(
+                "token_mode must be 'wap' or 'patch'."
+            )
 
-        # CLS token 用于汇聚整条 RSSI 指纹，不再使用 mean pooling。
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
-        nn.init.normal_(self.ap_embedding, mean=0.0, std=0.02)
-        nn.init.normal_(self.cls_token, mean=0.0, std=0.02)
+        if config.patch_size <= 0:
+            raise ValueError(
+                "patch_size must be positive."
+            )
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            activation="relu",
-            batch_first=True,
-            # 论文描述为 LayerNorm(x + Sublayer(x))，对应 post-norm。
-            norm_first=False,
+        self.input_dim = int(input_dim)
+        self.config = config
+
+        # 根据 token_mode 决定 Transformer 的序列长度
+        # 以及 token embedding 的输入维度。
+        if config.token_mode == "wap":
+            # 每一个 WAP 数值作为一个 token。
+            #
+            # (batch, input_dim)
+            # ->
+            # (batch, input_dim, 1)
+            # ->
+            # (batch, input_dim, d_model)
+            self.num_tokens = self.input_dim
+            self.token_embedding = nn.Linear(
+                1,
+                config.d_model,
+            )
+
+        else:
+            # 每 patch_size 个连续 WAP 特征组成一个 token。
+            self.num_tokens = math.ceil(
+                self.input_dim / config.patch_size
+            )
+            self.padded_dim = (
+                self.num_tokens * config.patch_size
+            )
+
+            # 每个 patch 包含 patch_size 个 RSSI 数值。
+            self.token_embedding = nn.Linear(
+                config.patch_size,
+                config.d_model,
+            )
+
+        # 可学习的位置编码，用来区分不同的 WAP 或 patch。
+        self.position_embedding = nn.Parameter(
+            torch.zeros(
+                1,
+                self.num_tokens,
+                config.d_model,
+            )
         )
+
+        # 使用 PyTorch 官方 TransformerEncoderLayer，
+        # 不再手写注意力、残差连接和 LayerNorm。
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=config.d_model,
+            nhead=config.nhead,
+            dim_feedforward=config.dim_feedforward,
+            dropout=config.dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+
         self.encoder = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=num_layers,
+            encoder_layer=encoder_layer,
+            num_layers=config.num_layers,
+            norm=nn.LayerNorm(config.d_model),
             enable_nested_tensor=False,
         )
-        self.output_norm = nn.LayerNorm(d_model)
 
-        # 直接使用 d_model 维 CLS 特征重构 520 维 RSSI。
-        # 编码特征也原样交给 SVR，不再增加额外 latent 压缩层。
+        # 将 Transformer 输出压缩成固定长度的 latent 特征。
+        self.latent_head = nn.Sequential(
+            nn.Linear(
+                config.d_model,
+                config.latent_dim,
+            ),
+            nn.GELU(),
+            nn.LayerNorm(config.latent_dim),
+        )
+
+        # 根据 latent 特征重建原始 WAP 输入。
         self.decoder = nn.Sequential(
-            nn.Linear(d_model, dim_feedforward),
-            nn.ReLU(),
-            nn.Linear(dim_feedforward, input_dim),
-            nn.Sigmoid(),
+            nn.Linear(
+                config.latent_dim,
+                config.dim_feedforward,
+            ),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(
+                config.dim_feedforward,
+                self.input_dim,
+            ),
         )
 
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [batch_size, 520]
-        wap_tokens = self.input_projection(x.unsqueeze(-1))
-        wap_tokens = wap_tokens + self.ap_embedding
-
-        cls_tokens = self.cls_token.expand(x.size(0), -1, -1)
-        tokens = torch.cat([cls_tokens, wap_tokens], dim=1)
-
-        hidden = self.encoder(tokens)
-
-        # 第 0 个位置是 CLS token，形状为 [batch_size, d_model]。
-        return self.output_norm(hidden[:, 0, :])
-
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        encoded = self.encode(x)
-        reconstructed = self.decoder(encoded)
-        return reconstructed, encoded
-
-
-class CoordinateMLP(nn.Module):
-    """使用 Transformer 编码特征预测经纬度的两层 MLP。"""
-
-    def __init__(self, input_dim: int, hidden_dim: int = 128) -> None:
-        super().__init__()
-        second_hidden = max(hidden_dim // 2, 16)
-        self.network = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, second_hidden),
-            nn.ReLU(),
-            nn.Linear(second_hidden, 2),
+        # 使用较小方差初始化位置编码。
+        nn.init.normal_(
+            self.position_embedding,
+            mean=0.0,
+            std=0.02,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.network(x)
+    def _to_tokens(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        """根据 token_mode 将二维 WAP 输入转换成 token 序列。"""
+
+        if x.ndim != 2 or x.shape[1] != self.input_dim:
+            raise ValueError(
+                f"Expected shape "
+                f"(batch, {self.input_dim}), "
+                f"got {tuple(x.shape)}."
+            )
+
+        if self.config.token_mode == "wap":
+            # 每一个 WAP 增加一个维度，作为独立 token。
+            token_values = x.unsqueeze(-1)
+
+        else:
+            # Patch 模式下，如果特征数量不能整除 patch_size，
+            # 则只在末尾补零。
+            if self.padded_dim > self.input_dim:
+                x = F.pad(
+                    x,
+                    (
+                        0,
+                        self.padded_dim
+                        - self.input_dim,
+                    ),
+                )
+
+            token_values = x.reshape(
+                x.shape[0],
+                self.num_tokens,
+                self.config.patch_size,
+            )
+
+        # 将 WAP 标量或 patch 向量映射成 d_model 维 token。
+        tokens = self.token_embedding(token_values)
+
+        return tokens + self.position_embedding
+
+    def encode(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        """提取固定长度的 latent 特征，供后续 SVR 使用。"""
+
+        tokens = self._to_tokens(x)
+        encoded = self.encoder(tokens)
+
+        # 当前不使用 CLS token，直接对所有 token 做平均池化。
+        pooled = encoded.mean(dim=1)
+
+        return self.latent_head(pooled)
+
+    def decode(
+        self,
+        latent: torch.Tensor,
+    ) -> torch.Tensor:
+        """根据 latent 特征重建原始 WAP 输入。"""
+
+        if (
+            latent.ndim != 2
+            or latent.shape[1] != self.config.latent_dim
+        ):
+            raise ValueError(
+                f"Expected latent shape "
+                f"(batch, {self.config.latent_dim}), "
+                f"got {tuple(latent.shape)}."
+            )
+
+        return self.decoder(latent)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        """执行完整自编码器前向传播。"""
+
+        latent = self.encode(x)
+        return self.decode(latent)
+
+    def checkpoint_payload(
+        self,
+    ) -> dict[str, object]:
+        """构造保存到 transformer.pt 的完整检查点。"""
+
+        return {
+            "input_dim": self.input_dim,
+            "model_config": asdict(self.config),
+
+            # 保存 CPU 权重，便于在不同设备之间加载。
+            "state_dict": {
+                key: value.detach().cpu()
+                for key, value
+                in self.state_dict().items()
+            },
+        }
+
