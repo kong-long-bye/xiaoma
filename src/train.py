@@ -702,41 +702,49 @@ def parse_args() -> argparse.Namespace:
         "--train-csv",
         type=Path,
         default=DEFAULT_CONFIG.data.train_csv,
+        help="训练集 CSV 文件路径（UJIIndoorLoc trainingData.csv）。",
     )
     parser.add_argument(
         "--eval-csv",
         type=Path,
         default=DEFAULT_CONFIG.data.eval_csv,
+        help="官方评估集 CSV 文件路径（validationData.csv）。",
     )
     parser.add_argument(
         "--model-root",
         type=Path,
         default=DEFAULT_CONFIG.model_root,
+        help="模型产物、预测结果和日志的输出根目录。",
     )
     parser.add_argument(
         "--building-id",
         type=int,
         default=DEFAULT_CONFIG.data.building_id,
+        help="建筑编号筛选：-1 使用全部建筑，0/1/2 只使用指定建筑。",
     )
     parser.add_argument(
         "--branch",
         type=str,
         default=None,
+        help="运行分支名，用于组织产物子目录（None 则自动生成时间戳）。",
     )
     parser.add_argument(
         "--device",
         type=str,
         default=DEFAULT_CONFIG.training.device,
+        help="PyTorch 设备，auto 优先使用 CUDA，不可用时回退到 CPU。",
     )
     parser.add_argument(
         "--epochs",
         type=int,
         default=DEFAULT_CONFIG.training.epochs,
+        help="Transformer 自编码器最大训练轮数。",
     )
     parser.add_argument(
         "--batch-size",
         type=int,
         default=DEFAULT_CONFIG.training.batch_size,
+        help="自编码器训练阶段的 mini-batch 大小。",
     )
     parser.add_argument(
         "--feature-batch-size",
@@ -744,21 +752,25 @@ def parse_args() -> argparse.Namespace:
         default=(
             DEFAULT_CONFIG.training.feature_batch_size
         ),
+        help="提取 latent 特征时的推理 batch 大小。",
     )
     parser.add_argument(
         "--learning-rate",
         type=float,
         default=DEFAULT_CONFIG.training.learning_rate,
+        help="AdamW 优化器的初始学习率。",
     )
     parser.add_argument(
         "--svr-c",
         type=float,
         default=DEFAULT_CONFIG.training.svr_c,
+        help="SVR 正则化参数 C，越大则对训练误差的惩罚越重。",
     )
     parser.add_argument(
         "--svr-epsilon",
         type=float,
         default=DEFAULT_CONFIG.training.svr_epsilon,
+        help="SVR 的 epsilon 参数，控制 epsilon-insensitive 管道宽度。",
     )
     parser.add_argument(
         "--svr-max-train-samples",
@@ -766,22 +778,26 @@ def parse_args() -> argparse.Namespace:
         default=(
             DEFAULT_CONFIG.training.svr_max_train_samples
         ),
+        help="拟合 SVR 的最大样本数，0 表示使用全部样本（数据量大时可限制以加速）。",
     )
 
     # 冒烟测试只读取少量数据，用来快速验证代码能否完整运行。
     parser.add_argument(
         "--smoke-test",
         action="store_true",
+        help="开启冒烟测试，只读取少量数据快速验证全流程。",
     )
     parser.add_argument(
         "--smoke-train-rows",
         type=int,
         default=512,
+        help="冒烟测试时读取的训练集行数。",
     )
     parser.add_argument(
         "--smoke-eval-rows",
         type=int,
         default=128,
+        help="冒烟测试时读取的评估集行数。",
     )
 
     return parser.parse_args()
