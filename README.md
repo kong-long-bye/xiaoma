@@ -250,3 +250,23 @@ model/<branch>/<time>/
 ```text
 model/log/<branch>/<time>_<branch>.log
 ```
+
+参数	说明
+```
+--train-csv	训练集 CSV 路径
+--eval-csv	官方评估集 CSV 路径
+--model-root	模型产物、预测和日志的输出根目录
+--building-id	建筑编号筛选（-1 = 全部，0/1/2 = 指定建筑）
+--branch	运行分支名，None 则自动生成时间戳
+--device	PyTorch 设备（auto 优先 CUDA）
+--epochs	自编码器最大训练轮数
+--batch-size	训练 mini-batch 大小
+--feature-batch-size	提取 latent 特征的推理 batch 大小
+--learning-rate	AdamW 初始学习率
+--svr-c	SVR 正则化参数 C
+--svr-epsilon	SVR 的 epsilon 管道宽度
+--svr-max-train-samples	SVR 最大训练样本数（0 = 全量）
+--smoke-test	开启冒烟测试快速验证全流程
+--smoke-train-rows	冒烟测试训练集行数
+--smoke-eval-rows	冒烟测试评估集行数
+```
