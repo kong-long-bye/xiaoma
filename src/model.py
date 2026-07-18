@@ -32,7 +32,8 @@ class WiFiTransformerAutoencoder(nn.Module):
         shape = (batch_size, WAP特征数量)
 
     输出:
-        forward() 返回重建后的 WAP 特征；
+        forward(x) 返回重建后的 WAP 特征；
+        forward(x, joint=True) 返回 (重建结果, 坐标预测)；
         encode() 返回给 SVR 使用的 latent 特征；
         decode() 根据 latent 特征重建原始输入。
 
@@ -155,12 +156,39 @@ class WiFiTransformerAutoencoder(nn.Module):
             ),
         )
 
+        # MLP 回归头：将 latent 特征映射到坐标 (longitude, latitude)。
+        self._init_regression_head(config)
+
         # 使用较小方差初始化位置编码。
         nn.init.normal_(
             self.position_embedding,
             mean=0.0,
             std=0.02,
         )
+
+    def _init_regression_head(
+        self,
+        config: ModelConfig,
+    ) -> None:
+        """初始化 MLP 回归头。"""
+
+        mlp_hidden = [
+            int(x)
+            for x in config.mlp_hidden_sizes.split(",")
+        ]
+
+        layers: list[nn.Module] = []
+        prev_dim = config.latent_dim
+
+        for hidden_dim in mlp_hidden:
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            layers.append(nn.GELU())
+            layers.append(nn.Dropout(config.dropout))
+            prev_dim = hidden_dim
+
+        # 输出二维坐标：经度、纬度。
+        layers.append(nn.Linear(prev_dim, 2))
+        self.regression_head = nn.Sequential(*layers)
 
     def _to_tokens(
         self,
@@ -238,10 +266,25 @@ class WiFiTransformerAutoencoder(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-    ) -> torch.Tensor:
-        """执行完整自编码器前向传播。"""
+        joint: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """执行完整自编码器前向传播。
+
+        Args:
+            x: 输入 WAP 特征。
+            joint: 若为 True，跳过解码，直接用 MLP 回归头输出坐标。
+
+        Returns:
+            joint=False: 重建后的 WAP 特征。
+            joint=True: 坐标预测 (batch, 2)。
+        """
 
         latent = self.encode(x)
+
+        if joint:
+            # MLP 模式：直接回归坐标，不做重建。
+            return self.regression_head(latent)
+
         return self.decode(latent)
 
     def checkpoint_payload(

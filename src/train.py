@@ -7,9 +7,10 @@ from __future__ import annotations
 2. 清洗缺失 WiFi 信号并删除几乎全缺失的 WAP；
 3. 划分训练集和内部验证集；
 4. 使用 Transformer 自编码器学习 WiFi 表示；
-5. 提取 latent 特征；
-6. 使用多输出 SVR 回归经纬度；
-7. 保存模型、配置、指标、预测结果和 UTF-8 日志。
+5. 选择回归器：
+   - "svr": 提取 latent -> 多输出 SVR 回归经纬度；
+   - "mlp": 使用 MLP 回归头端到端联合训练；
+6. 保存模型、配置、指标、预测结果和 UTF-8 日志。
 """
 
 import argparse
@@ -261,13 +262,37 @@ def train_autoencoder(
     config: TrainingConfig,
     device: torch.device,
 ) -> pd.DataFrame:
-    """训练 Transformer 自编码器，并返回每轮损失记录。"""
+    """训练 Transformer 自编码器（可选联合训练 MLP 回归头）。"""
 
     logger = logging.getLogger("xiaoma")
     pin_memory = device.type == "cuda"
 
+    joint = config.regressor == "mlp"
+
+    if joint:
+        logger.info(
+            "Joint training mode: MLP regression only "
+            "(decoder disabled)."
+        )
+
+        train_dataset = TensorDataset(
+            torch.from_numpy(data.X_train),
+            torch.from_numpy(data.y_train),
+        )
+        validation_dataset = TensorDataset(
+            torch.from_numpy(data.X_validation),
+            torch.from_numpy(data.y_validation),
+        )
+    else:
+        train_dataset = TensorDataset(
+            torch.from_numpy(data.X_train)
+        )
+        validation_dataset = TensorDataset(
+            torch.from_numpy(data.X_validation)
+        )
+
     train_loader = DataLoader(
-        TensorDataset(torch.from_numpy(data.X_train)),
+        train_dataset,
         batch_size=config.batch_size,
         shuffle=True,
         num_workers=config.num_workers,
@@ -275,7 +300,7 @@ def train_autoencoder(
     )
 
     validation_loader = DataLoader(
-        TensorDataset(torch.from_numpy(data.X_validation)),
+        validation_dataset,
         batch_size=config.batch_size,
         shuffle=False,
         num_workers=config.num_workers,
@@ -315,16 +340,30 @@ def train_autoencoder(
         train_loss_sum = 0.0
         train_items = 0
 
-        for (batch,) in train_loader:
-            batch = batch.to(
-                device,
-                non_blocking=True,
-            )
+        for batch in train_loader:
+            if joint:
+                batch_x, batch_y = batch
+                batch_x = batch_x.to(
+                    device, non_blocking=True
+                )
+                batch_y = batch_y.to(
+                    device, non_blocking=True
+                )
 
-            optimizer.zero_grad(set_to_none=True)
+                optimizer.zero_grad(set_to_none=True)
 
-            reconstruction = model(batch)
-            loss = criterion(reconstruction, batch)
+                coord = model(batch_x, joint=True)
+                loss = criterion(coord, batch_y)
+            else:
+                (batch_x,) = batch
+                batch_x = batch_x.to(
+                    device, non_blocking=True
+                )
+
+                optimizer.zero_grad(set_to_none=True)
+
+                reconstruction = model(batch_x)
+                loss = criterion(reconstruction, batch_x)
 
             loss.backward()
 
@@ -336,8 +375,8 @@ def train_autoencoder(
 
             optimizer.step()
 
-            train_loss_sum += float(loss.item()) * len(batch)
-            train_items += len(batch)
+            train_loss_sum += float(loss.item()) * len(batch_x)
+            train_items += len(batch_x)
 
         # --------------------
         # 验证阶段
@@ -347,17 +386,34 @@ def train_autoencoder(
         validation_items = 0
 
         with torch.inference_mode():
-            for (batch,) in validation_loader:
-                batch = batch.to(
-                    device,
-                    non_blocking=True,
-                )
+            for batch in validation_loader:
+                if joint:
+                    batch_x, batch_y = batch
+                    batch_x = batch_x.to(
+                        device, non_blocking=True
+                    )
+                    batch_y = batch_y.to(
+                        device, non_blocking=True
+                    )
 
-                loss = criterion(model(batch), batch)
+                    coord = model(
+                        batch_x, joint=True
+                    )
+                    loss = criterion(coord, batch_y)
+                else:
+                    (batch_x,) = batch
+                    batch_x = batch_x.to(
+                        device, non_blocking=True
+                    )
+
+                    loss = criterion(
+                        model(batch_x), batch_x
+                    )
+
                 validation_loss_sum += (
-                    float(loss.item()) * len(batch)
+                    float(loss.item()) * len(batch_x)
                 )
-                validation_items += len(batch)
+                validation_items += len(batch_x)
 
         train_loss = train_loss_sum / max(train_items, 1)
         validation_loss = (
@@ -431,6 +487,36 @@ def extract_latent(
     for (batch,) in loader:
         latent = model.encode(batch.to(device))
         chunks.append(latent.cpu().numpy())
+
+    return np.concatenate(
+        chunks,
+        axis=0,
+    ).astype(np.float32)
+
+
+@torch.inference_mode()
+def predict_regression(
+    model: WiFiTransformerAutoencoder,
+    features: np.ndarray,
+    device: torch.device,
+    batch_size: int,
+) -> np.ndarray:
+    """使用模型回归头批量预测坐标。"""
+
+    loader = DataLoader(
+        TensorDataset(torch.from_numpy(features)),
+        batch_size=batch_size,
+        shuffle=False,
+    )
+
+    model.eval()
+    chunks: list[np.ndarray] = []
+
+    for (batch,) in loader:
+        coords = model(
+            batch.to(device), joint=True
+        )
+        chunks.append(coords.cpu().numpy())
 
     return np.concatenate(
         chunks,
@@ -565,44 +651,65 @@ def run_training(
         device,
     )
 
-    # 自编码器训练结束后，分别提取三个数据集的 latent 特征。
-    train_latent = extract_latent(
-        model,
-        data.X_train,
-        device,
-        config.training.feature_batch_size,
-    )
+    if config.training.regressor == "mlp":
+        logger.info(
+            "Predicting coordinates via model regression head."
+        )
 
-    validation_latent = extract_latent(
-        model,
-        data.X_validation,
-        device,
-        config.training.feature_batch_size,
-    )
+        # MLP 模式不需要显式提取 latent，回归头直接在 forward 中产出坐标。
+        validation_prediction = predict_regression(
+            model,
+            data.X_validation,
+            device,
+            config.training.feature_batch_size,
+        )
+        evaluation_prediction = predict_regression(
+            model,
+            data.X_evaluation,
+            device,
+            config.training.feature_batch_size,
+        )
 
-    evaluation_latent = extract_latent(
-        model,
-        data.X_evaluation,
-        device,
-        config.training.feature_batch_size,
-    )
+    else:
+        # 自编码器训练结束后，分别提取三个数据集的 latent 特征。
+        train_latent = extract_latent(
+            model,
+            data.X_train,
+            device,
+            config.training.feature_batch_size,
+        )
 
-    logger.info(
-        "Fitting MultiOutputRegressor(SVR) with target scaling."
-    )
+        validation_latent = extract_latent(
+            model,
+            data.X_validation,
+            device,
+            config.training.feature_batch_size,
+        )
 
-    regressor = fit_svr(
-        train_latent,
-        data.y_train,
-        config.training,
-    )
+        evaluation_latent = extract_latent(
+            model,
+            data.X_evaluation,
+            device,
+            config.training.feature_batch_size,
+        )
 
-    validation_prediction = regressor.predict(
-        validation_latent
-    )
-    evaluation_prediction = regressor.predict(
-        evaluation_latent
-    )
+        logger.info(
+            "Fitting MultiOutputRegressor(SVR) "
+            "with target scaling."
+        )
+
+        regressor = fit_svr(
+            train_latent,
+            data.y_train,
+            config.training,
+        )
+
+        validation_prediction = regressor.predict(
+            validation_latent
+        )
+        evaluation_prediction = regressor.predict(
+            evaluation_latent
+        )
 
     metrics = {
         "validation": distance_metrics(
@@ -632,19 +739,26 @@ def run_training(
     )
 
     # pipeline.joblib 保存预测所需的非神经网络对象。
+    pipeline: dict[str, object] = {
+        "feature_names": data.feature_names,
+        "feature_scaler": data.scaler,
+        "raw_missing_value": (
+            config.data.raw_missing_value
+        ),
+        "filled_missing_value": (
+            config.data.filled_missing_value
+        ),
+        "transformer_file": "transformer.pt",
+    }
+
+    if config.training.regressor == "mlp":
+        pipeline["regressor_type"] = "mlp"
+    else:
+        pipeline["regressor_type"] = "svr"
+        pipeline["regressor"] = regressor
+
     joblib.dump(
-        {
-            "feature_names": data.feature_names,
-            "feature_scaler": data.scaler,
-            "regressor": regressor,
-            "raw_missing_value": (
-                config.data.raw_missing_value
-            ),
-            "filled_missing_value": (
-                config.data.filled_missing_value
-            ),
-            "transformer_file": "transformer.pt",
-        },
+        pipeline,
         paths.artifact_dir / "pipeline.joblib",
     )
 
@@ -694,8 +808,30 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Train the refactored UJIIndoorLoc "
-            "Transformer + SVR model."
+            "Transformer + SVR/MLP model."
         )
+    )
+
+    parser.add_argument(
+        "--regressor",
+        type=str,
+        default=DEFAULT_CONFIG.training.regressor,
+        choices={"svr", "mlp"},
+        help="回归器类型：svr（两阶段 SVR）或 mlp（端到端 MLP 回归头）。",
+    )
+    parser.add_argument(
+        "--regression-loss-weight",
+        type=float,
+        default=(
+            DEFAULT_CONFIG.training.regression_loss_weight
+        ),
+        help="MLP 联合训练时回归损失的权重。",
+    )
+    parser.add_argument(
+        "--mlp-hidden-sizes",
+        type=str,
+        default=DEFAULT_CONFIG.model.mlp_hidden_sizes,
+        help="MLP 回归头隐藏层大小，逗号分隔，如 128,64。",
     )
 
     parser.add_argument(
@@ -820,6 +956,8 @@ def build_config(args: argparse.Namespace) -> AppConfig:
         batch_size=args.batch_size,
         feature_batch_size=args.feature_batch_size,
         learning_rate=args.learning_rate,
+        regressor=args.regressor,
+        regression_loss_weight=args.regression_loss_weight,
         svr_c=args.svr_c,
         svr_epsilon=args.svr_epsilon,
         svr_max_train_samples=(
@@ -827,9 +965,15 @@ def build_config(args: argparse.Namespace) -> AppConfig:
         ),
     )
 
+    model_config = replace(
+        DEFAULT_CONFIG.model,
+        mlp_hidden_sizes=args.mlp_hidden_sizes,
+    )
+
     return replace(
         DEFAULT_CONFIG,
         data=data_config,
+        model=model_config,
         training=training_config,
         model_root=args.model_root,
     )

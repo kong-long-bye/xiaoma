@@ -172,7 +172,10 @@ def predict(
         config=model_config,
     ).to(device)
 
-    model.load_state_dict(checkpoint["state_dict"])
+    model.load_state_dict(
+        checkpoint["state_dict"],
+        strict=False,
+    )
 
     frame = pd.read_csv(input_csv)
     feature_names = list(pipeline["feature_names"])
@@ -206,14 +209,48 @@ def predict(
         features.to_numpy()
     ).astype(np.float32)
 
-    latent = extract_latent(
-        model,
-        scaled,
-        device,
-        batch_size,
+    regressor_type = pipeline.get(
+        "regressor_type", "svr"
     )
 
-    prediction = pipeline["regressor"].predict(latent)
+    if regressor_type == "mlp":
+        # MLP 模式：使用模型的回归头直接预测坐标。
+        loader = DataLoader(
+            TensorDataset(
+                torch.from_numpy(scaled)
+            ),
+            batch_size=batch_size,
+            shuffle=False,
+        )
+
+        model.eval()
+        chunks: list[np.ndarray] = []
+
+        with torch.inference_mode():
+            for (batch,) in loader:
+                coords = model(
+                    batch.to(device), joint=True
+                )
+                chunks.append(
+                    coords.cpu().numpy()
+                )
+
+        prediction = np.concatenate(
+            chunks, axis=0
+        ).astype(np.float32)
+
+    else:
+        # SVR 模式：提取 latent 后用 sklearn 回归器。
+        latent = extract_latent(
+            model,
+            scaled,
+            device,
+            batch_size,
+        )
+
+        prediction = pipeline["regressor"].predict(
+            latent
+        )
 
     # 在原始 CSV 后追加预测坐标，方便继续分析其他字段。
     output = frame.copy()
@@ -259,7 +296,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Predict coordinates with a trained "
-            "Transformer + SVR model."
+            "Transformer + SVR/MLP model."
         )
     )
 
