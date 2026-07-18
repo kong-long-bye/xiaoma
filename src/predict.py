@@ -239,6 +239,17 @@ def predict(
             chunks, axis=0
         ).astype(np.float32)
 
+        # 将标准化后的坐标预测还原为原始坐标量级
+        target_scaler = pipeline.get(
+            "target_scaler"
+        )
+        if target_scaler is not None:
+            prediction = (
+                target_scaler.inverse_transform(
+                    prediction
+                )
+            )
+
     else:
         # SVR 模式：提取 latent 后用 sklearn 回归器。
         latent = extract_latent(

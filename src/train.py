@@ -631,6 +631,24 @@ def run_training(
         ),
     )
 
+    # 保存原始坐标副本，用于最终指标计算和 CSV 输出
+    #（MLP 模式下 y 会被标准化，但指标和 CSV 需要原始坐标）
+    y_validation_orig = data.y_validation.copy()
+    y_evaluation_orig = data.y_evaluation.copy()
+
+    if config.training.regressor == "mlp":
+        # MLP 模式：对坐标做标准化，让 MSE 落在合理量级
+        target_scaler = StandardScaler()
+        data.y_train = (
+            target_scaler.fit_transform(data.y_train).astype(np.float32)
+        )
+        data.y_validation = (
+            target_scaler.transform(data.y_validation).astype(np.float32)
+        )
+        data.y_evaluation = (
+            target_scaler.transform(data.y_evaluation).astype(np.float32)
+        )
+
     model = WiFiTransformerAutoencoder(
         input_dim=data.X_train.shape[1],
         config=config.model,
@@ -668,6 +686,18 @@ def run_training(
             data.X_evaluation,
             device,
             config.training.feature_batch_size,
+        )
+
+        # 将标准化后的坐标预测还原为原始坐标量级
+        validation_prediction = (
+            target_scaler.inverse_transform(
+                validation_prediction
+            )
+        )
+        evaluation_prediction = (
+            target_scaler.inverse_transform(
+                evaluation_prediction
+            )
         )
 
     else:
@@ -713,11 +743,11 @@ def run_training(
 
     metrics = {
         "validation": distance_metrics(
-            data.y_validation,
+            y_validation_orig,
             validation_prediction,
         ),
         "evaluation": distance_metrics(
-            data.y_evaluation,
+            y_evaluation_orig,
             evaluation_prediction,
         ),
         "preprocessing": data.summary,
@@ -753,6 +783,7 @@ def run_training(
 
     if config.training.regressor == "mlp":
         pipeline["regressor_type"] = "mlp"
+        pipeline["target_scaler"] = target_scaler
     else:
         pipeline["regressor_type"] = "svr"
         pipeline["regressor"] = regressor
@@ -771,7 +802,7 @@ def run_training(
 
     _prediction_frame(
         data.validation_metadata,
-        data.y_validation,
+        y_validation_orig,
         validation_prediction,
     ).to_csv(
         paths.artifact_dir / "predictions_validation.csv",
@@ -781,7 +812,7 @@ def run_training(
 
     _prediction_frame(
         data.evaluation_metadata,
-        data.y_evaluation,
+        y_evaluation_orig,
         evaluation_prediction,
     ).to_csv(
         paths.artifact_dir / "predictions_evaluation.csv",
