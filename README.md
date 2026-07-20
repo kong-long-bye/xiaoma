@@ -190,7 +190,6 @@ $env:XIAOMA_TORCH_THREADS=4
 python -m src.train
 ```
 
-
 # Windows 版 README（建议替换原 README）
 
 ## 环境
@@ -252,6 +251,7 @@ model/log/<branch>/<time>_<branch>.log
 ```
 
 参数	说明
+
 ```
 --train-csv	训练集 CSV 路径
 --eval-csv	官方评估集 CSV 路径
@@ -269,4 +269,6 @@ model/log/<branch>/<time>_<branch>.log
 --smoke-test	开启冒烟测试快速验证全流程
 --smoke-train-rows	冒烟测试训练集行数
 --smoke-eval-rows	冒烟测试评估集行数
+----regressor      使用mlp还是svr
+-mlp-hidden-sizes 256,128,64
 ```
