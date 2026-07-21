@@ -34,7 +34,7 @@ class DataConfig:
     feature_missing_threshold: float = 0.98
     # False：保留全部 WAP001-WAP520
     # True：过滤几乎从不出现的 WAP
-    enable_feature_filtering: bool = False
+    enable_feature_filtering: bool = True
     # UJIIndoorLoc 使用 100 表示没有检测到对应的 WiFi 信号。
     raw_missing_value: float = 100.0
 
@@ -62,7 +62,7 @@ class ModelConfig:
     dim_feedforward: int = 128
 
     # Transformer 和解码器中的 dropout。
-    dropout: float = 0.10
+    dropout: float = 0.15
 
     # 每多少个连续 WAP 特征组成一个 patch。
     # 这样可以显著缩短 Transformer 的序列长度。
@@ -87,7 +87,7 @@ class TrainingConfig:
     epochs: int = 30
     batch_size: int = 128
     feature_batch_size: int = 512
-    learning_rate: float = 1e-3
+    learning_rate: float = 5e-4
     weight_decay: float = 1e-5
 
     # 验证损失连续多少轮没有明显下降时停止训练。
