@@ -517,6 +517,15 @@ def run_training(
 ) -> Path:
     """执行完整训练任务并返回模型产物目录。"""
 
+    set_seed(config.training.seed)
+    device = select_device(config.training.device)
+
+    if config.model.token_mode == "wap" and device.type != "cuda":
+        raise RuntimeError(
+            "wap mode is the paper model and requires CUDA/GPU. "
+            "Use --token-mode patch for CPU runs."
+        )
+
     paths = create_run_paths(
         model_root=config.model_root,
         project_root=PROJECT_ROOT,
@@ -529,10 +538,12 @@ def run_training(
     logger.info("Artifacts: %s", paths.artifact_dir)
     logger.info("UTF-8 log: %s", paths.log_file)
 
-    set_seed(config.training.seed)
-    device = select_device(config.training.device)
-
     logger.info("Device: %s", device)
+    logger.info(
+        "Token mode: %s | patch_size: %d",
+        config.model.token_mode,
+        config.model.patch_size,
+    )
 
     data = prepare_data(
         config.data,
@@ -723,6 +734,17 @@ def parse_args() -> argparse.Namespace:
         help="建筑编号筛选：-1 使用全部建筑，0/1/2 只使用指定建筑。",
     )
     parser.add_argument(
+        "--enable-feature-filtering",
+        action="store_true",
+        help="Remove WAP features whose training-set missing ratio reaches the threshold.",
+    )
+    parser.add_argument(
+        "--feature-missing-threshold",
+        type=float,
+        default=DEFAULT_CONFIG.data.feature_missing_threshold,
+        help="WAP missing-ratio threshold; default: 0.98.",
+    )
+    parser.add_argument(
         "--branch",
         type=str,
         default=None,
@@ -733,6 +755,22 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=DEFAULT_CONFIG.training.device,
         help="PyTorch 设备，auto 优先使用 CUDA，不可用时回退到 CPU。",
+    )
+    parser.add_argument(
+        "--token-mode",
+        type=str,
+        choices=("patch", "wap"),
+        default=DEFAULT_CONFIG.model.token_mode,
+        help=(
+            "Transformer token 化方式：patch 可在 CPU 上运行；"
+            "wap 是论文复现模式，需要 CUDA/GPU。"
+        ),
+    )
+    parser.add_argument(
+        "--patch-size",
+        type=int,
+        default=DEFAULT_CONFIG.model.patch_size,
+        help="patch 模式下每个 token 包含的连续 WAP 特征数量。",
     )
     parser.add_argument(
         "--epochs",
@@ -811,6 +849,8 @@ def build_config(args: argparse.Namespace) -> AppConfig:
         train_csv=args.train_csv,
         eval_csv=args.eval_csv,
         building_id=args.building_id,
+        enable_feature_filtering=args.enable_feature_filtering,
+        feature_missing_threshold=args.feature_missing_threshold,
     )
 
     training_config = replace(
@@ -827,9 +867,16 @@ def build_config(args: argparse.Namespace) -> AppConfig:
         ),
     )
 
+    model_config = replace(
+        DEFAULT_CONFIG.model,
+        token_mode=args.token_mode,
+        patch_size=args.patch_size,
+    )
+
     return replace(
         DEFAULT_CONFIG,
         data=data_config,
+        model=model_config,
         training=training_config,
         model_root=args.model_root,
     )

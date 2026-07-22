@@ -90,6 +90,9 @@ conda env remove -n xiaoma
 CUDA 兼容情况不同。需要 GPU 时，应在创建环境后，根据本机环境安装对应的
 PyTorch CUDA 构建；代码中的 `--device auto` 会在 CUDA 可用时自动使用 GPU。
 
+当前项目有两种训练模式：`patch` 是 CPU 友好的快速/轻量模式；`wap` 是论文复现模式，
+每个 WAP 特征作为独立 token，训练时需要 CUDA/GPU。
+
 ## requirements.txt 是否还能使用
 
 可以。`requirements.txt` 并不与 Conda 冲突，可以先创建 Conda 环境，
@@ -120,25 +123,36 @@ python -m src.train \
   --epochs 1 \
   --batch-size 32 \
   --device cpu \
+  --token-mode patch \
+  --patch-size 16 \
   --branch smoke-test
 ```
 
 Windows PowerShell 可以写成一行：
 
 ```powershell
-python -m src.train --smoke-test --epochs 1 --batch-size 32 --device cpu --branch smoke-test
+python -m src.train --smoke-test --epochs 1 --batch-size 32 --device cpu --token-mode patch --patch-size 16 --branch smoke-test
 ```
 
 ## 完整训练
 
-```bash
-python -m src.train
-```
-
-常用参数：
+CPU / patch 模式：
 
 ```bash
 python -m src.train \
+  --token-mode patch \
+  --patch-size 16 \
+  --device cpu \
+  --epochs 30 \
+  --batch-size 128 \
+  --building-id -1
+```
+
+GPU / wap 论文复现模式：
+
+```bash
+python -m src.train \
+  --token-mode wap \
   --device auto \
   --epochs 30 \
   --batch-size 128 \
@@ -147,8 +161,7 @@ python -m src.train \
   --svr-epsilon 0.1
 ```
 
-完整数据在 CPU 上训练可能较慢。
-GPU 可用时，`--device auto` 会自动使用 CUDA。
+`wap` 模式会在没有 CUDA/GPU 时直接报错；没有 GPU 时请使用 `patch` 模式。
 
 ## 预测
 
@@ -206,25 +219,27 @@ conda activate xiaoma
 ## 快速测试（一行）
 
 ```powershell
-python -m src.train --smoke-test --epochs 1 --batch-size 32 --device cpu --branch smoke-test
+python -m src.train --smoke-test --epochs 1 --batch-size 32 --device cpu --token-mode patch --patch-size 16 --branch smoke-test
 ```
 
 ## 正式训练（一行）
 
-```powershell
-python -m src.train
-```
+CPU / patch 模式：
 
 ```powershell
-python -m src.train --building-id 0
+python -m src.train --token-mode patch --patch-size 16 --device cpu --epochs 30 --batch-size 128
 ```
 
-```powershell
-python -m src.train --device auto
-```
+GPU / wap 论文复现模式：
 
 ```powershell
-python -m src.train --epochs 50 --batch-size 128 --learning-rate 0.001 --branch experiment01
+python -m src.train --token-mode wap --device auto --epochs 30 --batch-size 128 --branch wap-gpu
+```
+
+指定建筑训练：
+
+```powershell
+python -m src.train --token-mode patch --device cpu --building-id 0
 ```
 
 ## 预测（一行）
@@ -259,6 +274,8 @@ model/log/<branch>/<time>_<branch>.log
 --building-id	建筑编号筛选（-1 = 全部，0/1/2 = 指定建筑）
 --branch	运行分支名，None 则自动生成时间戳
 --device	PyTorch 设备（auto 优先 CUDA）
+--token-mode	训练模式：patch 可在 CPU 上运行；wap 是论文复现模式，需要 GPU
+--patch-size	patch 模式下每个 token 包含的连续 WAP 特征数量
 --epochs	自编码器最大训练轮数
 --batch-size	训练 mini-batch 大小
 --feature-batch-size	提取 latent 特征的推理 batch 大小
