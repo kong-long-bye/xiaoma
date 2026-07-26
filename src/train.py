@@ -261,18 +261,40 @@ def train_autoencoder(
     data: PreparedData,
     config: TrainingConfig,
     device: torch.device,
+    target_scaler: StandardScaler | None = None,
 ) -> pd.DataFrame:
-    """训练 Transformer 自编码器（可选联合训练 MLP 回归头）。"""
+    """训练 Transformer。
+
+    两种训练模式：
+
+    1. regressor == "svr"
+       训练 Transformer 自编码器，按照内部验证集的重建
+       validation_loss 保存最佳模型。
+
+    2. regressor == "mlp"
+       Transformer + MLP 端到端预测坐标，按照内部验证集的
+       distance_mean 保存最佳模型；mean 基本相同时比较 median。
+    """
 
     logger = logging.getLogger("xiaoma")
     pin_memory = device.type == "cuda"
 
     joint = config.regressor == "mlp"
 
+    # MLP 模式的坐标经过 StandardScaler 标准化。
+    # 每个 epoch 计算米制距离时必须使用它恢复原始坐标。
+    if joint and target_scaler is None:
+        raise ValueError(
+            "target_scaler is required when regressor='mlp'."
+        )
+
+    # ------------------------------------------------------------------
+    # 构造训练集与验证集
+    # ------------------------------------------------------------------
     if joint:
         logger.info(
-            "Joint training mode: MLP regression only "
-            "(decoder disabled)."
+            "Joint training mode: Transformer + MLP regression "
+            "(checkpoint selected by validation distance)."
         )
 
         train_dataset = TensorDataset(
@@ -284,6 +306,11 @@ def train_autoencoder(
             torch.from_numpy(data.y_validation),
         )
     else:
+        logger.info(
+            "Autoencoder training mode "
+            "(checkpoint selected by reconstruction loss)."
+        )
+
         train_dataset = TensorDataset(
             torch.from_numpy(data.X_train)
         )
@@ -307,7 +334,8 @@ def train_autoencoder(
         pin_memory=pin_memory,
     )
 
-    # 自编码器目标就是重建输入，因此使用均方误差。
+    # SVR 模式：重建输入特征的 MSE。
+    # MLP 模式：标准化坐标的 MSE。
     criterion = nn.MSELoss()
 
     optimizer = torch.optim.AdamW(
@@ -316,7 +344,8 @@ def train_autoencoder(
         weight_decay=config.weight_decay,
     )
 
-    # 验证损失不再下降时自动降低学习率。
+    # MLP 模式下 scheduler.step() 使用 distance_mean。
+    # SVR 模式下 scheduler.step() 使用 validation_loss。
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode="min",
@@ -327,47 +356,76 @@ def train_autoencoder(
         ),
     )
 
+    # SVR/自编码器模式使用。
     best_loss = float("inf")
+
+    # MLP 模式使用。
+    best_distance_mean = float("inf")
+    best_distance_median = float("inf")
+
+    best_epoch = 0
     best_state: dict[str, torch.Tensor] | None = None
+
     patience = 0
     history: list[dict[str, float | int]] = []
 
+    # ------------------------------------------------------------------
+    # Epoch 循环
+    # ------------------------------------------------------------------
     for epoch in range(1, config.epochs + 1):
-        # --------------------
+        # ==============================================================
         # 训练阶段
-        # --------------------
+        # ==============================================================
         model.train()
+
         train_loss_sum = 0.0
         train_items = 0
 
         for batch in train_loader:
+            optimizer.zero_grad(set_to_none=True)
+
             if joint:
                 batch_x, batch_y = batch
+
                 batch_x = batch_x.to(
-                    device, non_blocking=True
+                    device,
+                    non_blocking=True,
                 )
+
                 batch_y = batch_y.to(
-                    device, non_blocking=True
+                    device,
+                    non_blocking=True,
                 )
 
-                optimizer.zero_grad(set_to_none=True)
+                # MLP 模式直接预测标准化后的二维坐标。
+                coordinate_prediction = model(
+                    batch_x,
+                    joint=True,
+                )
 
-                coord = model(batch_x, joint=True)
-                loss = criterion(coord, batch_y)
+                loss = criterion(
+                    coordinate_prediction,
+                    batch_y,
+                )
             else:
                 (batch_x,) = batch
+
                 batch_x = batch_x.to(
-                    device, non_blocking=True
+                    device,
+                    non_blocking=True,
                 )
 
-                optimizer.zero_grad(set_to_none=True)
-
+                # SVR 模式先训练自编码器。
                 reconstruction = model(batch_x)
-                loss = criterion(reconstruction, batch_x)
+
+                loss = criterion(
+                    reconstruction,
+                    batch_x,
+                )
 
             loss.backward()
 
-            # 梯度裁剪用于降低 Transformer 训练时梯度爆炸的风险。
+            # 防止 Transformer 出现梯度爆炸。
             nn.utils.clip_grad_norm_(
                 model.parameters(),
                 max_norm=1.0,
@@ -375,95 +433,356 @@ def train_autoencoder(
 
             optimizer.step()
 
-            train_loss_sum += float(loss.item()) * len(batch_x)
-            train_items += len(batch_x)
+            batch_size = len(batch_x)
 
-        # --------------------
+            train_loss_sum += (
+                float(loss.item()) * batch_size
+            )
+
+            train_items += batch_size
+
+        train_loss = (
+            train_loss_sum / max(train_items, 1)
+        )
+
+        # ==============================================================
         # 验证阶段
-        # --------------------
+        # ==============================================================
         model.eval()
+
         validation_loss_sum = 0.0
         validation_items = 0
+
+        # 只有 MLP 模式需要收集坐标预测。
+        validation_prediction_chunks: list[np.ndarray] = []
+        validation_target_chunks: list[np.ndarray] = []
 
         with torch.inference_mode():
             for batch in validation_loader:
                 if joint:
                     batch_x, batch_y = batch
+
                     batch_x = batch_x.to(
-                        device, non_blocking=True
-                    )
-                    batch_y = batch_y.to(
-                        device, non_blocking=True
+                        device,
+                        non_blocking=True,
                     )
 
-                    coord = model(
-                        batch_x, joint=True
+                    batch_y = batch_y.to(
+                        device,
+                        non_blocking=True,
                     )
-                    loss = criterion(coord, batch_y)
-                else:
-                    (batch_x,) = batch
-                    batch_x = batch_x.to(
-                        device, non_blocking=True
+
+                    coordinate_prediction = model(
+                        batch_x,
+                        joint=True,
                     )
 
                     loss = criterion(
-                        model(batch_x), batch_x
+                        coordinate_prediction,
+                        batch_y,
                     )
 
+                    # 保存标准化坐标，验证循环结束后统一恢复原始坐标。
+                    validation_prediction_chunks.append(
+                        coordinate_prediction
+                        .detach()
+                        .cpu()
+                        .numpy()
+                    )
+
+                    validation_target_chunks.append(
+                        batch_y
+                        .detach()
+                        .cpu()
+                        .numpy()
+                    )
+                else:
+                    (batch_x,) = batch
+
+                    batch_x = batch_x.to(
+                        device,
+                        non_blocking=True,
+                    )
+
+                    reconstruction = model(batch_x)
+
+                    loss = criterion(
+                        reconstruction,
+                        batch_x,
+                    )
+
+                batch_size = len(batch_x)
+
                 validation_loss_sum += (
-                    float(loss.item()) * len(batch_x)
+                    float(loss.item()) * batch_size
                 )
-                validation_items += len(batch_x)
 
-        train_loss = train_loss_sum / max(train_items, 1)
+                validation_items += batch_size
+
         validation_loss = (
-            validation_loss_sum / max(validation_items, 1)
+            validation_loss_sum
+            / max(validation_items, 1)
         )
 
-        scheduler.step(validation_loss)
-        current_lr = float(optimizer.param_groups[0]["lr"])
+        # 默认设置为 NaN。
+        # SVR 模式不会在这里产生定位距离。
+        validation_distance_mean = float("nan")
+        validation_distance_median = float("nan")
 
-        history.append(
-            {
-                "epoch": epoch,
-                "train_loss": train_loss,
-                "validation_loss": validation_loss,
-                "learning_rate": current_lr,
-            }
-        )
-
-        logger.info(
-            "Epoch %03d/%03d | train_loss=%.8f | "
-            "validation_loss=%.8f | lr=%.3e",
-            epoch,
-            config.epochs,
-            train_loss,
-            validation_loss,
-            current_lr,
-        )
-
-        # 保存验证损失最优的权重，而不是最后一轮权重。
-        if validation_loss < best_loss - config.min_delta:
-            best_loss = validation_loss
-            best_state = copy.deepcopy(model.state_dict())
-            patience = 0
-        else:
-            patience += 1
-
-            if patience >= config.early_stopping_patience:
-                logger.info(
-                    "Early stopping at epoch %d.",
-                    epoch,
+        # ==============================================================
+        # MLP 模式：计算当前 epoch 的真实定位距离
+        # ==============================================================
+        if joint:
+            if not validation_prediction_chunks:
+                raise RuntimeError(
+                    "No validation predictions were produced."
                 )
-                break
 
+            validation_prediction_scaled = np.concatenate(
+                validation_prediction_chunks,
+                axis=0,
+            )
+
+            validation_target_scaled = np.concatenate(
+                validation_target_chunks,
+                axis=0,
+            )
+
+            # 标准化坐标恢复成原始 LONGITUDE、LATITUDE。
+            validation_prediction_original = (
+                target_scaler.inverse_transform(
+                    validation_prediction_scaled
+                )
+            )
+
+            validation_target_original = (
+                target_scaler.inverse_transform(
+                    validation_target_scaled
+                )
+            )
+
+            validation_metrics = distance_metrics(
+                validation_target_original,
+                validation_prediction_original,
+            )
+
+            validation_distance_mean = float(
+                validation_metrics["distance_mean"]
+            )
+
+            validation_distance_median = float(
+                validation_metrics["distance_median"]
+            )
+
+            # MLP 模式：学习率根据真实定位距离调整。
+            scheduler.step(validation_distance_mean)
+        else:
+            # 自编码器模式：学习率根据重建损失调整。
+            scheduler.step(validation_loss)
+
+        current_lr = float(
+            optimizer.param_groups[0]["lr"]
+        )
+
+        # ==============================================================
+        # 保存训练历史
+        # ==============================================================
+        history_row: dict[str, float | int] = {
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "validation_loss": validation_loss,
+            "learning_rate": current_lr,
+        }
+
+        if joint:
+            history_row["validation_distance_mean"] = (
+                validation_distance_mean
+            )
+
+            history_row["validation_distance_median"] = (
+                validation_distance_median
+            )
+
+        history.append(history_row)
+
+        # ==============================================================
+        # 打印当前 epoch 日志
+        # ==============================================================
+        if joint:
+            logger.info(
+                "Epoch %03d/%03d | "
+                "train_loss=%.8f | "
+                "validation_loss=%.8f | "
+                "distance_mean=%.6f | "
+                "distance_median=%.6f | "
+                "lr=%.3e",
+                epoch,
+                config.epochs,
+                train_loss,
+                validation_loss,
+                validation_distance_mean,
+                validation_distance_median,
+                current_lr,
+            )
+        else:
+            logger.info(
+                "Epoch %03d/%03d | "
+                "train_loss=%.8f | "
+                "validation_loss=%.8f | "
+                "lr=%.3e",
+                epoch,
+                config.epochs,
+                train_loss,
+                validation_loss,
+                current_lr,
+            )
+
+        # ==============================================================
+        # 判断当前 epoch 是否为最佳模型
+        # ==============================================================
+        if joint:
+            # distance_mean 是主要保存指标。
+            mean_improved = (
+                validation_distance_mean
+                < best_distance_mean - config.min_delta
+            )
+
+            # mean 的差距不超过 min_delta 时，认为两者基本相同。
+            mean_tied = (
+                abs(
+                    validation_distance_mean
+                    - best_distance_mean
+                )
+                <= config.min_delta
+            )
+
+            # mean 基本相同时，比较 median。
+            median_improved = (
+                validation_distance_median
+                < best_distance_median
+            )
+
+            improved = (
+                mean_improved
+                or (
+                    mean_tied
+                    and median_improved
+                )
+            )
+
+            if improved:
+                best_distance_mean = (
+                    validation_distance_mean
+                )
+
+                best_distance_median = (
+                    validation_distance_median
+                )
+
+                best_epoch = epoch
+
+                best_state = copy.deepcopy(
+                    model.state_dict()
+                )
+
+                patience = 0
+
+                logger.info(
+                    "New best MLP checkpoint | "
+                    "epoch=%d | "
+                    "distance_mean=%.6f | "
+                    "distance_median=%.6f",
+                    best_epoch,
+                    best_distance_mean,
+                    best_distance_median,
+                )
+            else:
+                patience += 1
+        else:
+            # SVR/自编码器模式保持原来的保存逻辑。
+            improved = (
+                validation_loss
+                < best_loss - config.min_delta
+            )
+
+            if improved:
+                best_loss = validation_loss
+                best_epoch = epoch
+
+                best_state = copy.deepcopy(
+                    model.state_dict()
+                )
+
+                patience = 0
+
+                logger.info(
+                    "New best autoencoder checkpoint | "
+                    "epoch=%d | "
+                    "validation_loss=%.8f",
+                    best_epoch,
+                    best_loss,
+                )
+            else:
+                patience += 1
+
+        # ==============================================================
+        # Early stopping
+        # ==============================================================
+        if patience >= config.early_stopping_patience:
+            if joint:
+                logger.info(
+                    "Early stopping at epoch %d | "
+                    "best_epoch=%d | "
+                    "best_distance_mean=%.6f | "
+                    "best_distance_median=%.6f",
+                    epoch,
+                    best_epoch,
+                    best_distance_mean,
+                    best_distance_median,
+                )
+            else:
+                logger.info(
+                    "Early stopping at epoch %d | "
+                    "best_epoch=%d | "
+                    "best_validation_loss=%.8f",
+                    epoch,
+                    best_epoch,
+                    best_loss,
+                )
+
+            break
+
+    # ------------------------------------------------------------------
+    # 恢复最佳 epoch 的权重
+    # ------------------------------------------------------------------
     if best_state is None:
         raise RuntimeError(
-            "Autoencoder training did not produce a valid checkpoint."
+            "Training did not produce a valid checkpoint."
         )
 
     model.load_state_dict(best_state)
+
+    if joint:
+        logger.info(
+            "Restored best MLP checkpoint | "
+            "epoch=%d | "
+            "distance_mean=%.6f | "
+            "distance_median=%.6f",
+            best_epoch,
+            best_distance_mean,
+            best_distance_median,
+        )
+    else:
+        logger.info(
+            "Restored best autoencoder checkpoint | "
+            "epoch=%d | "
+            "validation_loss=%.8f",
+            best_epoch,
+            best_loss,
+        )
+
     return pd.DataFrame(history)
+
 
 
 @torch.inference_mode()
@@ -667,6 +986,11 @@ def run_training(
         data,
         config.training,
         device,
+        target_scaler=(
+            target_scaler
+            if config.training.regressor == "mlp"
+            else None
+        ),
     )
 
     if config.training.regressor == "mlp":

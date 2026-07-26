@@ -34,7 +34,7 @@ class DataConfig:
     feature_missing_threshold: float = 0.98
     # False：保留全部 WAP001-WAP520
     # True：过滤几乎从不出现的 WAP
-    enable_feature_filtering: bool = False
+    enable_feature_filtering: bool = True
     # UJIIndoorLoc 使用 100 表示没有检测到对应的 WiFi 信号。
     raw_missing_value: float = 100.0
 
@@ -87,14 +87,14 @@ class TrainingConfig:
     device: str = "auto"
 
     # 自编码器训练参数。
-    epochs: int = 30
+    epochs: int = 60
     batch_size: int = 128
     feature_batch_size: int = 512
-    learning_rate: float = 1e-3
+    learning_rate: float = 5e-4
     weight_decay: float = 1e-5
 
     # 验证损失连续多少轮没有明显下降时停止训练。
-    early_stopping_patience: int = 5
+    early_stopping_patience: int = 10
     min_delta: float = 1e-5
 
     # DataLoader 工作进程数。Windows 环境建议保留为 0。
