@@ -29,11 +29,11 @@ class MLPSingleConfig:
     # MLP 网络结构
     hidden_layer_sizes: tuple[int, ...] = (256, 128, 64)
     activation: str = "relu"
-    solver: str = "adam"
-    alpha: float = 1e-4
+    dropout: float = 0.10
 
-    # 优化器参数
+    # 优化器参数（使用 AdamW，与 Transformer 训练保持一致）
     learning_rate_init: float = 1e-3
+    weight_decay: float = 1e-5
     batch_size: int = 128
 
     # 训练控制
@@ -41,19 +41,21 @@ class MLPSingleConfig:
     early_stopping_patience: int = 10
     min_delta: float = 1e-5
 
-    # 随机种子
+    # 随机种子和设备
     seed: int = 42
+    device: str = "auto"
 
     def to_dict(self) -> dict:
         return {
             "hidden_layer_sizes": list(self.hidden_layer_sizes),
             "activation": self.activation,
-            "solver": self.solver,
-            "alpha": self.alpha,
+            "dropout": self.dropout,
             "learning_rate_init": self.learning_rate_init,
+            "weight_decay": self.weight_decay,
             "batch_size": self.batch_size,
             "epochs": self.epochs,
             "early_stopping_patience": self.early_stopping_patience,
             "min_delta": self.min_delta,
             "seed": self.seed,
+            "device": self.device,
         }

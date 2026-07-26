@@ -3,7 +3,7 @@ from __future__ import annotations
 """MLP-only 基线模型训练入口。
 
 用于 Transformer 消融实验，完全移除 Transformer 编码器，
-直接将预处理后的 WAP 特征输入 sklearn MLPRegressor 预测坐标。
+直接将预处理后的 WAP 特征输入 PyTorch MLP 预测坐标。
 
 支持两种启动方式：
     python src/mlp-single/mlp-single.py
@@ -21,12 +21,13 @@ from typing import Any
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.metrics import mean_squared_error
-from sklearn.neural_network import MLPRegressor
+import torch
+import torch.nn as nn
 from sklearn.preprocessing import StandardScaler
+from torch.utils.data import DataLoader, TensorDataset
 
 # ---------------------------------------------------------------------------
-# sys.path 处理：保证无论从项目根目录还是从 src/mlp-single/ 启动都能导入 src.*
+# sys.path 处理
 # ---------------------------------------------------------------------------
 _current_file = Path(__file__).resolve()
 _mlp_single_dir = _current_file.parent
@@ -54,9 +55,58 @@ from src.utils import (
     create_run_paths,
     distance_metrics,
     save_json,
+    select_device,
     set_seed,
     setup_logging,
 )
+
+# ---------------------------------------------------------------------------
+# 激活函数映射
+# ---------------------------------------------------------------------------
+_ACTIVATION_MAP: dict[str, type[nn.Module]] = {
+    "relu": nn.ReLU,
+    "tanh": nn.Tanh,
+    "logistic": nn.Sigmoid,
+}
+
+
+class MLPModel(nn.Module):
+    """纯 MLP 回归器，不含 Transformer 编码器。
+
+    结构：input -> Linear + Act + Dropout -> ... -> Linear(2) -> (lng, lat)
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_layer_sizes: tuple[int, ...],
+        output_dim: int = 2,
+        activation: str = "relu",
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+
+        act_cls = _ACTIVATION_MAP.get(activation)
+        if act_cls is None:
+            raise ValueError(
+                f"Unsupported activation: {activation}. "
+                f"Supported: {list(_ACTIVATION_MAP)}"
+            )
+
+        layers: list[nn.Module] = []
+        prev_dim = input_dim
+        for hidden_dim in hidden_layer_sizes:
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            layers.append(act_cls())
+            if dropout > 0.0:
+                layers.append(nn.Dropout(dropout))
+            prev_dim = hidden_dim
+
+        layers.append(nn.Linear(prev_dim, output_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
 
 
 def _prediction_frame(
@@ -73,26 +123,31 @@ def _prediction_frame(
     return output
 
 
+def _model_forward(
+    model: MLPModel,
+    features: np.ndarray,
+    device: torch.device,
+) -> np.ndarray:
+    """以推理模式将 numpy 特征输入模型并返回 numpy 预测结果。"""
+    model.eval()
+    with torch.inference_mode():
+        tensor = torch.from_numpy(features).to(device, non_blocking=True)
+        pred = model(tensor).cpu().numpy()
+    return pred
+
+
 def train_mlp(
     mlp_config: MLPSingleConfig,
     data,
+    device: torch.device,
     logger: logging.Logger,
-) -> tuple[MLPRegressor, StandardScaler, pd.DataFrame, int, float]:
-    """训练 MLP 回归器并返回最佳模型、target_scaler、训练历史等。
-
-    Parameters
-    ----------
-    mlp_config : MLPSingleConfig
-        MLP 超参数配置。
-    data : PreparedData
-        prepare_data() 返回的数据对象。
-    logger : logging.Logger
-        日志记录器。
+) -> tuple[MLPModel, StandardScaler, pd.DataFrame, int, float]:
+    """训练 PyTorch MLP 回归器并返回最佳模型、target_scaler、训练历史等。
 
     Returns
     -------
-    best_model : MLPRegressor
-        验证损失最佳的模型（deepcopy 恢复后的状态）。
+    best_model : MLPModel
+        验证损失最佳的模型（恢复到最佳 epoch 权重）。
     target_scaler : StandardScaler
         在 y_train 上拟合的标准化器。
     history_df : pd.DataFrame
@@ -102,68 +157,112 @@ def train_mlp(
     best_val_loss : float
         最佳验证损失（标准化空间）。
     """
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
     # 目标值缩放：只使用 y_train 拟合 scaler，避免数据泄漏
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
     target_scaler = StandardScaler()
     y_train_scaled = target_scaler.fit_transform(data.y_train)
     y_validation_scaled = target_scaler.transform(data.y_validation)
     y_evaluation_scaled = target_scaler.transform(data.y_evaluation)
 
-    logger.info("Target scaler fitted on y_train (mean=%s, std=%s)",
-                target_scaler.mean_, target_scaler.scale_)
-
-    # -----------------------------------------------------------------------
-    # 构造 MLPRegressor：warm_start=True 逐 epoch 训练
-    # -----------------------------------------------------------------------
-    mlp = MLPRegressor(
-        hidden_layer_sizes=mlp_config.hidden_layer_sizes,
-        activation=mlp_config.activation,
-        solver=mlp_config.solver,
-        alpha=mlp_config.alpha,
-        learning_rate_init=mlp_config.learning_rate_init,
-        batch_size=mlp_config.batch_size,
-        max_iter=1,
-        warm_start=True,
-        early_stopping=False,
-        random_state=mlp_config.seed,
-        verbose=False,
+    logger.info(
+        "Target scaler fitted on y_train (mean=%s, std=%s)",
+        target_scaler.mean_,
+        target_scaler.scale_,
     )
 
-    # 计算模型参数量
+    # -------------------------------------------------------------------
+    # 构造 MLP 模型
+    # -------------------------------------------------------------------
     n_input = data.X_train.shape[1]
-    n_output = 2
-    param_count = 0
-    layers = [n_input] + list(mlp_config.hidden_layer_sizes) + [n_output]
-    for i in range(len(layers) - 1):
-        n_params = layers[i] * layers[i + 1] + layers[i + 1]  # weights + biases
-        param_count += n_params
-        logger.info("  Layer %d: %d -> %d (%d parameters)",
-                     i + 1, layers[i], layers[i + 1], n_params)
+    model = MLPModel(
+        input_dim=n_input,
+        hidden_layer_sizes=mlp_config.hidden_layer_sizes,
+        activation=mlp_config.activation,
+        dropout=mlp_config.dropout,
+    ).to(device)
 
-    logger.info("MLP total parameters: %d", param_count)
+    # 打印各层参数
+    param_count = 0
+    layers = [n_input] + list(mlp_config.hidden_layer_sizes) + [2]
+    for i in range(len(layers) - 1):
+        n_params = layers[i] * layers[i + 1] + layers[i + 1]
+        param_count += n_params
+        logger.info(
+            "  Layer %d: %d -> %d (%d parameters)",
+            i + 1,
+            layers[i],
+            layers[i + 1],
+            n_params,
+        )
+
+    total_params = sum(p.numel() for p in model.parameters())
+    logger.info("MLP total parameters: %d (torch)", total_params)
     logger.info("MLP config: %s", mlp_config.to_dict())
 
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
+    # 优化器和损失函数
+    # -------------------------------------------------------------------
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=mlp_config.learning_rate_init,
+        weight_decay=mlp_config.weight_decay,
+    )
+    criterion = nn.MSELoss()
+
+    # -------------------------------------------------------------------
+    # DataLoader
+    # -------------------------------------------------------------------
+    pin_memory = device.type == "cuda"
+    train_dataset = TensorDataset(
+        torch.from_numpy(data.X_train),
+        torch.from_numpy(y_train_scaled),
+    )
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=mlp_config.batch_size,
+        shuffle=True,
+        pin_memory=pin_memory,
+    )
+
+    X_val_tensor = torch.from_numpy(data.X_validation).to(device)
+    y_val_tensor = torch.from_numpy(y_validation_scaled).to(device)
+
+    # -------------------------------------------------------------------
     # 逐 epoch 训练循环
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
     best_val_loss = float("inf")
-    best_model: MLPRegressor | None = None
+    best_state: dict[str, torch.Tensor] | None = None
     best_epoch = 0
     patience_counter = 0
     history: list[dict[str, Any]] = []
 
     for epoch in range(1, mlp_config.epochs + 1):
-        # 训练一个迭代
-        mlp.fit(data.X_train, y_train_scaled)
+        # --- 训练阶段 ---
+        model.train()
+        train_loss_sum = 0.0
+        train_count = 0
 
-        # 计算训练损失（标准化空间）
-        y_train_pred = mlp.predict(data.X_train)
-        train_loss = float(mean_squared_error(y_train_scaled, y_train_pred))
+        for X_batch, y_batch in train_loader:
+            X_batch = X_batch.to(device, non_blocking=True)
+            y_batch = y_batch.to(device, non_blocking=True)
 
-        # 计算验证损失（标准化空间）
-        y_val_pred = mlp.predict(data.X_validation)
-        val_loss = float(mean_squared_error(y_validation_scaled, y_val_pred))
+            optimizer.zero_grad(set_to_none=True)
+            pred = model(X_batch)
+            loss = criterion(pred, y_batch)
+            loss.backward()
+            optimizer.step()
+
+            train_loss_sum += float(loss.item()) * len(X_batch)
+            train_count += len(X_batch)
+
+        train_loss = train_loss_sum / max(train_count, 1)
+
+        # --- 验证阶段 ---
+        model.eval()
+        with torch.inference_mode():
+            val_pred = model(X_val_tensor)
+            val_loss = float(criterion(val_pred, y_val_tensor).item())
 
         history.append({
             "epoch": epoch,
@@ -179,10 +278,10 @@ def train_mlp(
             val_loss,
         )
 
-        # 检查是否是最佳验证损失
+        # --- Early stopping ---
         if val_loss < best_val_loss - mlp_config.min_delta:
             best_val_loss = val_loss
-            best_model = copy.deepcopy(mlp)
+            best_state = copy.deepcopy(model.state_dict())
             best_epoch = epoch
             patience_counter = 0
         else:
@@ -196,10 +295,14 @@ def train_mlp(
                 )
                 break
 
-    if best_model is None:
+    if best_state is None:
         raise RuntimeError(
             "MLP training did not produce a valid best model."
         )
+
+    # 恢复到最佳 epoch 的权重
+    model.load_state_dict(best_state)
+    history_df = pd.DataFrame(history)
 
     logger.info(
         "Best model at epoch %d with validation_loss=%.8f",
@@ -207,14 +310,17 @@ def train_mlp(
         best_val_loss,
     )
 
-    history_df = pd.DataFrame(history)
+    # 评估集损失（标准化空间）
+    model.eval()
+    with torch.inference_mode():
+        X_eval_tensor = torch.from_numpy(data.X_evaluation).to(device)
+        y_eval_tensor = torch.from_numpy(y_evaluation_scaled).to(device)
+        eval_pred = model(X_eval_tensor)
+        eval_loss = float(criterion(eval_pred, y_eval_tensor).item())
 
-    # 验证评估集损失（标准化空间）
-    y_eval_pred = best_model.predict(data.X_evaluation)
-    eval_loss = float(mean_squared_error(y_evaluation_scaled, y_eval_pred))
     logger.info("Evaluation loss (scaled space): %.8f", eval_loss)
 
-    return best_model, target_scaler, history_df, best_epoch, best_val_loss
+    return model, target_scaler, history_df, best_epoch, best_val_loss
 
 
 def run_training(
@@ -241,6 +347,8 @@ def run_training(
     logger.info("UTF-8 log: %s", paths.log_file)
 
     set_seed(mlp_config.seed)
+    device = select_device(mlp_config.device)
+    logger.info("Device: %s", device)
     logger.info("Random seed: %d", mlp_config.seed)
 
     # -------------------------------------------------------------------
@@ -264,14 +372,19 @@ def run_training(
     best_model, target_scaler, history_df, best_epoch, best_val_loss = train_mlp(
         mlp_config=mlp_config,
         data=data,
+        device=device,
         logger=logger,
     )
 
     # -------------------------------------------------------------------
-    # 恢复最佳 MLP 并在原始坐标空间计算指标
+    # 在原始坐标空间计算指标
     # -------------------------------------------------------------------
-    validation_pred_scaled = best_model.predict(data.X_validation)
-    evaluation_pred_scaled = best_model.predict(data.X_evaluation)
+    validation_pred_scaled = _model_forward(
+        best_model, data.X_validation, device
+    )
+    evaluation_pred_scaled = _model_forward(
+        best_model, data.X_evaluation, device
+    )
 
     validation_pred = target_scaler.inverse_transform(validation_pred_scaled)
     evaluation_pred = target_scaler.inverse_transform(evaluation_pred_scaled)
@@ -291,12 +404,24 @@ def run_training(
     # -------------------------------------------------------------------
     # 保存产物
     # -------------------------------------------------------------------
-    joblib.dump(best_model, paths.artifact_dir / "mlp.joblib")
+    torch.save(
+        {
+            "input_dim": data.X_train.shape[1],
+            "hidden_layer_sizes": mlp_config.hidden_layer_sizes,
+            "activation": mlp_config.activation,
+            "dropout": mlp_config.dropout,
+            "state_dict": {
+                k: v.detach().cpu()
+                for k, v in best_model.state_dict().items()
+            },
+        },
+        paths.artifact_dir / "mlp.pt",
+    )
 
     joblib.dump(
         {
             "model_type": "mlp-single",
-            "model_file": "mlp.joblib",
+            "model_file": "mlp.pt",
             "feature_names": data.feature_names,
             "feature_scaler": data.scaler,
             "target_scaler": target_scaler,
@@ -389,22 +514,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="MLP 激活函数（relu, tanh, logistic）。",
     )
     parser.add_argument(
-        "--alpha",
+        "--dropout",
         type=float,
-        default=1e-4,
-        help="MLP L2 正则化参数。",
+        default=0.10,
+        help="Dropout 比率（0 表示不用 dropout）。",
     )
     parser.add_argument(
         "--learning-rate",
         type=float,
         default=1e-3,
-        help="MLP 初始学习率。",
+        help="AdamW 初始学习率。",
+    )
+    parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=1e-5,
+        help="AdamW 权重衰减（L2 正则化）。",
     )
     parser.add_argument(
         "--batch-size",
         type=int,
         default=128,
-        help="MLP mini-batch 大小。",
+        help="mini-batch 大小。",
     )
     parser.add_argument(
         "--epochs",
@@ -429,6 +560,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=42,
         help="随机种子。",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help='PyTorch 设备，auto 优先 CUDA，不可用时回退 CPU。',
     )
     parser.add_argument(
         "--smoke-test",
@@ -457,13 +594,15 @@ def build_config(args: argparse.Namespace) -> tuple[MLPSingleConfig, DataConfig,
     mlp_config = MLPSingleConfig(
         hidden_layer_sizes=parse_layer_sizes(args.hidden_layer_sizes),
         activation=args.activation,
-        alpha=args.alpha,
+        dropout=args.dropout,
         learning_rate_init=args.learning_rate,
+        weight_decay=args.weight_decay,
         batch_size=args.batch_size,
         epochs=args.epochs,
         early_stopping_patience=args.early_stopping_patience,
         min_delta=args.min_delta,
         seed=args.seed,
+        device=args.device,
     )
 
     data_config = DataConfig(

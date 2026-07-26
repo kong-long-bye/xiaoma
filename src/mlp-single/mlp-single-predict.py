@@ -2,8 +2,8 @@ from __future__ import annotations
 
 """MLP-only 基线模型预测入口。
 
-加载训练阶段保存的 MLP 模型和 pipeline，对输入 CSV 进行坐标预测。
-不需要 PyTorch 和 Transformer。
+加载训练阶段保存的 PyTorch MLP 模型和 pipeline，对输入 CSV 进行坐标预测。
+支持 GPU（通过 --device 参数）。
 
 支持两种启动方式：
     python src/mlp-single/mlp-single-predict.py --input data/validationData.csv
@@ -18,6 +18,8 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
+import torch
+import torch.nn as nn
 
 # ---------------------------------------------------------------------------
 # sys.path 处理
@@ -43,8 +45,54 @@ from src.utils import (
     create_run_paths,
     get_git_branch,
     latest_run_dir,
+    select_device,
     setup_logging,
 )
+
+# ---------------------------------------------------------------------------
+# 激活函数映射（与训练脚本保持一致）
+# ---------------------------------------------------------------------------
+_ACTIVATION_MAP: dict[str, type[nn.Module]] = {
+    "relu": nn.ReLU,
+    "tanh": nn.Tanh,
+    "logistic": nn.Sigmoid,
+}
+
+
+class MLPModel(nn.Module):
+    """纯 MLP 回归器，与训练脚本中的定义完全一致。"""
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_layer_sizes: tuple[int, ...],
+        output_dim: int = 2,
+        activation: str = "relu",
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+
+        act_cls = _ACTIVATION_MAP.get(activation)
+        if act_cls is None:
+            raise ValueError(
+                f"Unsupported activation: {activation}. "
+                f"Supported: {list(_ACTIVATION_MAP)}"
+            )
+
+        layers: list[nn.Module] = []
+        prev_dim = input_dim
+        for hidden_dim in hidden_layer_sizes:
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            layers.append(act_cls())
+            if dropout > 0.0:
+                layers.append(nn.Dropout(dropout))
+            prev_dim = hidden_dim
+
+        layers.append(nn.Linear(prev_dim, output_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
 
 
 def resolve_model_dir(
@@ -75,14 +123,10 @@ def resolve_model_dir(
     try:
         return latest_run_dir(model_root, branch_name)
     except FileNotFoundError:
-        # 非 Git 环境或切换分支后，允许回退到全局最新模型。
         candidates = sorted(
             path
             for path in model_root.glob("*/*")
-            if (
-                path.is_dir()
-                and path.parent.name != "log"
-            )
+            if (path.is_dir() and path.parent.name != "log")
         )
 
         if not candidates:
@@ -97,6 +141,7 @@ def predict(
     input_csv: Path,
     model_dir: Path,
     output_csv: Path,
+    device: torch.device,
     log_file: Path,
 ) -> Path:
     """加载 MLP-only 模型并对输入 CSV 执行预测。"""
@@ -122,14 +167,28 @@ def predict(
             f"This pipeline is not an MLP-only model."
         )
 
-    # 加载 MLP 模型
-    model_path = model_dir / str(pipeline.get("model_file", "mlp.joblib"))
+    # 加载 PyTorch 模型
+    model_path = model_dir / str(pipeline.get("model_file", "mlp.pt"))
     if not model_path.exists():
         raise FileNotFoundError(
             f"MLP model file not found: {model_path}"
         )
 
-    mlp = joblib.load(model_path)
+    checkpoint = torch.load(model_path, map_location=device, weights_only=True)
+    input_dim = int(checkpoint["input_dim"])
+    hidden_layer_sizes = tuple(checkpoint["hidden_layer_sizes"])
+    activation = str(checkpoint["activation"])
+    dropout = float(checkpoint["dropout"])
+
+    model = MLPModel(
+        input_dim=input_dim,
+        hidden_layer_sizes=hidden_layer_sizes,
+        activation=activation,
+        dropout=dropout,
+    ).to(device)
+
+    model.load_state_dict(checkpoint["state_dict"])
+    model.eval()
 
     feature_names: list[str] = list(pipeline["feature_names"])
     feature_scaler = pipeline["feature_scaler"]
@@ -163,12 +222,12 @@ def predict(
     )
 
     # 特征缩放
-    scaled = feature_scaler.transform(
-        features.to_numpy()
-    ).astype(np.float32)
+    scaled = feature_scaler.transform(features.to_numpy()).astype(np.float32)
 
     # MLP 预测（标准化坐标空间）
-    prediction_scaled = mlp.predict(scaled)
+    with torch.inference_mode():
+        tensor = torch.from_numpy(scaled).to(device, non_blocking=True)
+        prediction_scaled = model(tensor).cpu().numpy()
 
     # 恢复原始坐标尺度
     prediction = target_scaler.inverse_transform(prediction_scaled)
@@ -181,9 +240,7 @@ def predict(
     # 输入包含真实坐标时计算误差
     if {"LONGITUDE", "LATITUDE"}.issubset(output.columns):
         truth = output[["LONGITUDE", "LATITUDE"]].to_numpy()
-        output["ERROR_DISTANCE"] = np.linalg.norm(
-            truth - prediction, axis=1
-        )
+        output["ERROR_DISTANCE"] = np.linalg.norm(truth - prediction, axis=1)
 
     # 保存结果
     output_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -230,6 +287,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="输出 CSV 路径（默认自动生成）。",
     )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help='PyTorch 设备，auto 优先 CUDA，不可用时回退 CPU。',
+    )
 
     return parser.parse_args(argv)
 
@@ -246,7 +309,8 @@ def main(argv: list[str] | None = None) -> None:
             args.branch,
         )
 
-        # 只创建日志目录，不创建空模型目录
+        device = select_device(args.device)
+
         log_paths = create_run_paths(
             model_root=args.model_root,
             project_root=PROJECT_ROOT,
@@ -267,6 +331,7 @@ def main(argv: list[str] | None = None) -> None:
             input_csv=args.input,
             model_dir=model_dir,
             output_csv=output,
+            device=device,
             log_file=log_paths.log_file,
         )
     except Exception:
