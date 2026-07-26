@@ -69,8 +69,11 @@ class ModelConfig:
     token_mode: str = "wap"   # "wap" 或 "patch"
     patch_size: int = 16
 
-    # Transformer 编码后输出给 SVR 的最终特征维度。
+    # Transformer 编码后输出给 SVR/MLP 的最终特征维度。
     latent_dim: int = 64
+
+    # MLP 回归头隐藏层大小（逗号分隔），仅在 regressor="mlp" 时生效。
+    mlp_hidden_sizes: str = "128,64"
 
 
 @dataclass(frozen=True)
@@ -84,18 +87,25 @@ class TrainingConfig:
     device: str = "auto"
 
     # 自编码器训练参数。
-    epochs: int = 30
+    epochs: int = 60
     batch_size: int = 128
     feature_batch_size: int = 512
     learning_rate: float = 5e-4
     weight_decay: float = 1e-5
 
     # 验证损失连续多少轮没有明显下降时停止训练。
-    early_stopping_patience: int = 5
+    early_stopping_patience: int = 10
     min_delta: float = 1e-5
 
     # DataLoader 工作进程数。Windows 环境建议保留为 0。
     num_workers: int = 0
+
+    # 回归器类型："svr" 使用两阶段 SVR，"mlp" 使用 MLP 回归头端到端联合训练。
+    regressor: str = "svr"
+
+    # MLP 联合训练时回归损失的权重。
+    # total_loss = reconstruction_loss + regression_loss_weight * regression_loss
+    regression_loss_weight: float = 1.0
 
     # SVR 参数。
     svr_c: float = 100.0
