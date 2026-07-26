@@ -62,7 +62,7 @@ class ModelConfig:
     dim_feedforward: int = 128
 
     # Transformer 和解码器中的 dropout。
-    dropout: float = 0.15
+    dropout: float = 0.10
 
     # 每多少个连续 WAP 特征组成一个 patch。
     # 这样可以显著缩短 Transformer 的序列长度。
