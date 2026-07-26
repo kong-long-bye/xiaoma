@@ -34,7 +34,7 @@ class DataConfig:
     feature_missing_threshold: float = 0.98
     # False：保留全部 WAP001-WAP520
     # True：过滤几乎从不出现的 WAP
-    enable_feature_filtering: bool = False
+    enable_feature_filtering: bool = True
     # UJIIndoorLoc 使用 100 表示没有检测到对应的 WiFi 信号。
     raw_missing_value: float = 100.0
 
