@@ -32,7 +32,7 @@ class MLPSingleConfig:
     dropout: float = 0.10
 
     # 优化器参数（使用 AdamW，与 Transformer 训练保持一致）
-    learning_rate_init: float = 1e-3
+    learning_rate_init: float = 5e-4
     weight_decay: float = 1e-5
     batch_size: int = 128
 
