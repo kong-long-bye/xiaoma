@@ -170,6 +170,10 @@ def set_seed(seed: int) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
+    # 确保 cuDNN 使用确定性算法，保证相同 seed 下结果可复现。
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
 
 def select_device(requested: str) -> torch.device:
     """根据命令行参数选择 CPU 或 CUDA 设备。"""
