@@ -234,14 +234,67 @@ class WiFiTransformerAutoencoder(nn.Module):
     def encode(
         self,
         x: torch.Tensor,
+        observed_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """提取固定长度的 latent 特征，供后续 SVR 使用。"""
+        """提取固定长度的 latent 特征，供后续 SVR 使用。
+
+        传入 observed_mask 时：
+        - Transformer attention 忽略当前样本未检测到的 WAP；
+        - mean pooling 只平均当前样本检测到的 WAP。
+
+        当前实验只支持 token_mode="wap"，因此 observed_mask 的
+        shape 必须与输入 x 完全一致。
+        """
+
+        if observed_mask is not None:
+            if self.config.token_mode != "wap":
+                raise ValueError(
+                    "Dynamic observed_mask currently supports "
+                    "only token_mode='wap'."
+                )
+
+            if observed_mask.shape != x.shape:
+                raise ValueError(
+                    "observed_mask must have the same shape as x."
+                )
+
+            observed_mask = observed_mask.to(
+                device=x.device,
+                dtype=torch.bool,
+            )
+
+            if not observed_mask.any(dim=1).all():
+                raise ValueError(
+                    "Each sample must contain at least one "
+                    "observed WAP."
+                )
 
         tokens = self._to_tokens(x)
-        encoded = self.encoder(tokens)
+        encoded = self.encoder(
+            tokens,
+            src_key_padding_mask=(
+                None
+                if observed_mask is None
+                else ~observed_mask
+            ),
+        )
 
-        # 当前不使用 CLS token，直接对所有 token 做平均池化。
-        pooled = encoded.mean(dim=1)
+        # 当前不使用 CLS token。
+        if observed_mask is None:
+            # 没有传入 mask 时，维持原来的普通 mean pooling。
+            pooled = encoded.mean(dim=1)
+        else:
+            # Masked mean pooling：
+            # 每条样本只平均实际检测到的 WAP token。
+            weights = observed_mask.unsqueeze(-1).to(
+                encoded.dtype
+            )
+            pooled = (
+                encoded * weights
+            ).sum(dim=1)
+            pooled = pooled / weights.sum(
+                dim=1
+            ).clamp_min(1.0)
 
         return self.latent_head(pooled)
 
@@ -266,12 +319,15 @@ class WiFiTransformerAutoencoder(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
+        observed_mask: torch.Tensor | None = None,
         joint: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """执行完整自编码器前向传播。
 
         Args:
             x: 输入 WAP 特征。
+            observed_mask: 每条样本检测到的 WAP 掩码，与 x 形状相同；
+                为 None 时保持原来的普通 mean pooling。
             joint: 若为 True，跳过解码，直接用 MLP 回归头输出坐标。
 
         Returns:
@@ -279,7 +335,10 @@ class WiFiTransformerAutoencoder(nn.Module):
             joint=True: 坐标预测 (batch, 2)。
         """
 
-        latent = self.encode(x)
+        latent = self.encode(
+            x,
+            observed_mask,
+        )
 
         if joint:
             # MLP 模式：直接回归坐标，不做重建。

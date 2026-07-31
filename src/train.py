@@ -58,6 +58,12 @@ class PreparedData:
     X_validation: np.ndarray
     X_evaluation: np.ndarray
 
+    # 每条样本检测到了哪些 WAP（True）或没有检测到（False）。
+    # 在缩放之前根据原始值生成，供动态 attention mask 使用。
+    train_observed_mask: np.ndarray
+    validation_observed_mask: np.ndarray
+    evaluation_observed_mask: np.ndarray
+
     y_train: np.ndarray
     y_validation: np.ndarray
     y_evaluation: np.ndarray
@@ -189,6 +195,54 @@ def prepare_data(
     train_features = train_features[feature_names]
     eval_features = eval_features[feature_names]
 
+    # 在 scaler 之前生成动态 mask：
+    # 根据原始值判断每条样本检测到了哪些 WAP。
+    # 不能根据缩放后的 0.0 判断缺失，
+    # 因为有效 RSSI 也可能被缩放成 0。
+    train_feature_values = train_features.to_numpy()
+    evaluation_feature_values = eval_features.to_numpy()
+
+    train_observed_mask = (
+        train_feature_values
+        != config.filled_missing_value
+    )
+
+    evaluation_observed_mask = (
+        evaluation_feature_values
+        != config.filled_missing_value
+    )
+
+    # 动态 mask 要求每条样本至少检测到一个 WAP。
+    # 删除在所有选定特征上全部缺失的样本，
+    # 否则模型前向传播会抛出
+    # "Each sample must contain at least one observed WAP"。
+    train_keep = train_observed_mask.any(axis=1)
+    evaluation_keep = evaluation_observed_mask.any(axis=1)
+
+    if not train_keep.all():
+        logger.info(
+            "Dropped %d training samples with no observed WAP.",
+            int(len(train_keep) - train_keep.sum()),
+        )
+        train_df = train_df.loc[train_keep].reset_index(drop=True)
+        train_features = (
+            train_features.loc[train_keep].reset_index(drop=True)
+        )
+        train_observed_mask = train_observed_mask[train_keep]
+
+    if not evaluation_keep.all():
+        logger.info(
+            "Dropped %d evaluation samples with no observed WAP.",
+            int(len(evaluation_keep) - evaluation_keep.sum()),
+        )
+        eval_df = eval_df.loc[evaluation_keep].reset_index(drop=True)
+        eval_features = (
+            eval_features.loc[evaluation_keep].reset_index(drop=True)
+        )
+        evaluation_observed_mask = (
+            evaluation_observed_mask[evaluation_keep]
+        )
+
     # 目标是二维坐标：经度和纬度。
     targets = train_df[
         ["LONGITUDE", "LATITUDE"]
@@ -243,6 +297,15 @@ def prepare_data(
         X_train=X_train,
         X_validation=X_validation,
         X_evaluation=X_evaluation,
+        train_observed_mask=(
+            train_observed_mask[train_idx]
+        ),
+        validation_observed_mask=(
+            train_observed_mask[validation_idx]
+        ),
+        evaluation_observed_mask=(
+            evaluation_observed_mask
+        ),
         y_train=targets[train_idx],
         y_validation=targets[validation_idx],
         y_evaluation=eval_targets,
@@ -312,10 +375,16 @@ def train_autoencoder(
         )
 
         train_dataset = TensorDataset(
-            torch.from_numpy(data.X_train)
+            torch.from_numpy(data.X_train),
+            torch.from_numpy(
+                data.train_observed_mask
+            ),
         )
         validation_dataset = TensorDataset(
-            torch.from_numpy(data.X_validation)
+            torch.from_numpy(data.X_validation),
+            torch.from_numpy(
+                data.validation_observed_mask
+            ),
         )
 
     train_loader = DataLoader(
@@ -408,15 +477,23 @@ def train_autoencoder(
                     batch_y,
                 )
             else:
-                (batch_x,) = batch
+                batch_x, batch_mask = batch
 
                 batch_x = batch_x.to(
                     device,
                     non_blocking=True,
                 )
 
+                batch_mask = batch_mask.to(
+                    device,
+                    non_blocking=True,
+                )
+
                 # SVR 模式先训练自编码器。
-                reconstruction = model(batch_x)
+                reconstruction = model(
+                    batch_x,
+                    observed_mask=batch_mask,
+                )
 
                 loss = criterion(
                     reconstruction,
@@ -497,14 +574,22 @@ def train_autoencoder(
                         .numpy()
                     )
                 else:
-                    (batch_x,) = batch
+                    batch_x, batch_mask = batch
 
                     batch_x = batch_x.to(
                         device,
                         non_blocking=True,
                     )
 
-                    reconstruction = model(batch_x)
+                    batch_mask = batch_mask.to(
+                        device,
+                        non_blocking=True,
+                    )
+
+                    reconstruction = model(
+                        batch_x,
+                        observed_mask=batch_mask,
+                    )
 
                     loss = criterion(
                         reconstruction,
@@ -789,13 +874,17 @@ def train_autoencoder(
 def extract_latent(
     model: WiFiTransformerAutoencoder,
     features: np.ndarray,
+    observed_mask: np.ndarray,
     device: torch.device,
     batch_size: int,
 ) -> np.ndarray:
     """批量提取 Transformer latent 特征。"""
 
     loader = DataLoader(
-        TensorDataset(torch.from_numpy(features)),
+        TensorDataset(
+            torch.from_numpy(features),
+            torch.from_numpy(observed_mask),
+        ),
         batch_size=batch_size,
         shuffle=False,
     )
@@ -803,8 +892,14 @@ def extract_latent(
     model.eval()
     chunks: list[np.ndarray] = []
 
-    for (batch,) in loader:
-        latent = model.encode(batch.to(device))
+    for batch, batch_mask in loader:
+        batch = batch.to(device)
+        batch_mask = batch_mask.to(device)
+
+        latent = model.encode(
+            batch,
+            batch_mask,
+        )
         chunks.append(latent.cpu().numpy())
 
     return np.concatenate(
@@ -1029,6 +1124,7 @@ def run_training(
         train_latent = extract_latent(
             model,
             data.X_train,
+            data.train_observed_mask,
             device,
             config.training.feature_batch_size,
         )
@@ -1036,6 +1132,7 @@ def run_training(
         validation_latent = extract_latent(
             model,
             data.X_validation,
+            data.validation_observed_mask,
             device,
             config.training.feature_batch_size,
         )
@@ -1043,6 +1140,7 @@ def run_training(
         evaluation_latent = extract_latent(
             model,
             data.X_evaluation,
+            data.evaluation_observed_mask,
             device,
             config.training.feature_batch_size,
         )

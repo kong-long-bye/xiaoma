@@ -99,13 +99,17 @@ def resolve_model_dir(
 def extract_latent(
     model: WiFiTransformerAutoencoder,
     features: np.ndarray,
+    observed_mask: np.ndarray,
     device: torch.device,
     batch_size: int,
 ) -> np.ndarray:
     """分批提取预测数据的 Transformer latent 特征。"""
 
     loader = DataLoader(
-        TensorDataset(torch.from_numpy(features)),
+        TensorDataset(
+            torch.from_numpy(features),
+            torch.from_numpy(observed_mask),
+        ),
         batch_size=batch_size,
         shuffle=False,
     )
@@ -113,8 +117,14 @@ def extract_latent(
     chunks: list[np.ndarray] = []
     model.eval()
 
-    for (batch,) in loader:
-        latent = model.encode(batch.to(device))
+    for batch, batch_mask in loader:
+        batch = batch.to(device)
+        batch_mask = batch_mask.to(device)
+
+        latent = model.encode(
+            batch,
+            batch_mask,
+        )
         chunks.append(latent.cpu().numpy())
 
     return np.concatenate(
@@ -205,6 +215,12 @@ def predict(
         )
     )
 
+    # 与训练阶段相同，在 scaler 之前根据原始值生成动态 mask。
+    observed_mask = (
+        features.to_numpy()
+        != pipeline["filled_missing_value"]
+    )
+
     scaled = pipeline["feature_scaler"].transform(
         features.to_numpy()
     ).astype(np.float32)
@@ -255,6 +271,7 @@ def predict(
         latent = extract_latent(
             model,
             scaled,
+            observed_mask,
             device,
             batch_size,
         )
